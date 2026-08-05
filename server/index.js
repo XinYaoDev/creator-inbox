@@ -92,16 +92,40 @@ CREATE TABLE IF NOT EXISTS collect_log(
   ts INTEGER,
   result TEXT
 );
+CREATE TABLE IF NOT EXISTS avatar_cache(
+  url TEXT PRIMARY KEY,
+  contentType TEXT,
+  data BLOB,
+  ts INTEGER
+);
+CREATE TABLE IF NOT EXISTS sent_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER,
+  type TEXT,
+  target TEXT,
+  content TEXT,
+  upstream TEXT
+);
 `);
+
+// 迁移：comments 需要 rootCommentId 表达楼中楼父子关系；旧数据无此列则加列并重采
+{
+  const cols = db.prepare('PRAGMA table_info(comments)').all().map((c) => c.name);
+  if (!cols.includes('rootCommentId')) {
+    db.exec("ALTER TABLE comments ADD COLUMN rootCommentId TEXT DEFAULT ''");
+    db.exec('DELETE FROM comments');
+  }
+}
 
 const upVideo = db.prepare(`INSERT INTO videos(objectId,title,thumbUrl,createTime,commentCount)
   VALUES(?,?,?,?,?)
   ON CONFLICT(objectId) DO UPDATE SET title=excluded.title, thumbUrl=excluded.thumbUrl,
     createTime=excluded.createTime, commentCount=excluded.commentCount`);
-const upComment = db.prepare(`INSERT INTO comments(commentId,exportId,nickname,content,headUrl,createTime,likeCount)
-  VALUES(?,?,?,?,?,?,?)
+const upComment = db.prepare(`INSERT INTO comments(commentId,exportId,nickname,content,headUrl,createTime,likeCount,rootCommentId)
+  VALUES(?,?,?,?,?,?,?,?)
   ON CONFLICT(commentId) DO UPDATE SET nickname=excluded.nickname, content=excluded.content,
-    headUrl=excluded.headUrl, createTime=excluded.createTime, likeCount=excluded.likeCount`);
+    headUrl=excluded.headUrl, createTime=excluded.createTime, likeCount=excluded.likeCount,
+    rootCommentId=excluded.rootCommentId`);
 const upSession = db.prepare(`INSERT INTO dm_sessions(sessionId,username,nickname,headImgUrl,sessionType)
   VALUES(?,?,?,?,?)
   ON CONFLICT(sessionId) DO UPDATE SET username=excluded.username, nickname=excluded.nickname,
@@ -146,7 +170,7 @@ function saveVideo(v) {
   );
 }
 
-function saveComment(exportId, c) {
+function saveComment(exportId, c, rootCommentId = '') {
   const id = String(c.commentId || '');
   if (!id) return;
   upComment.run(
@@ -157,6 +181,7 @@ function saveComment(exportId, c) {
     String(c.commentHeadurl || ''),
     Number(c.commentCreatetime) || 0,
     Number(c.commentLikeCount) || 0,
+    String(rootCommentId || ''),
   );
 }
 
@@ -205,27 +230,29 @@ async function collectVideos(result) {
   }
 }
 
+async function collectCommentsForVideo(objectId, result) {
+  let buff = '';
+  const seen = new Set();
+  for (let page = 0; page < 30; page++) {
+    const r = await api(`${CGI}/comment/comment_list`, {
+      lastBuff: buff, exportId: String(objectId), commentSelection: false, forMcn: false,
+    });
+    checkErr(r, 'comment_list');
+    const d = r.data || {};
+    const list = d.comment || [];
+    for (const c of list) {
+      saveComment(objectId, c); result.comments++;
+      for (const l2 of c.levelTwoComment || []) saveComment(objectId, l2, c.commentId);
+    }
+    buff = d.lastBuff || '';
+    if (!buff || !list.length || seen.has(buff)) break;
+    seen.add(buff);
+  }
+}
+
 async function collectComments(result) {
   const vids = db.prepare('SELECT objectId FROM videos WHERE commentCount > 0').all();
-  for (const { objectId } of vids) {
-    let buff = '';
-    const seen = new Set();
-    for (let page = 0; page < 30; page++) {
-      const r = await api(`${CGI}/comment/comment_list`, {
-        lastBuff: buff, exportId: String(objectId), commentSelection: false, forMcn: false,
-      });
-      checkErr(r, 'comment_list');
-      const d = r.data || {};
-      const list = d.comment || [];
-      for (const c of list) {
-        saveComment(objectId, c); result.comments++;
-        for (const l2 of c.levelTwoComment || []) saveComment(objectId, l2);
-      }
-      buff = d.lastBuff || '';
-      if (!buff || !list.length || seen.has(buff)) break;
-      seen.add(buff);
-    }
-  }
+  for (const { objectId } of vids) await collectCommentsForVideo(objectId, result);
 }
 
 async function collectDM(result) {
@@ -320,6 +347,142 @@ function lastCollectInfo() {
   return { lastCollect: row.ts, lastResult: r };
 }
 
+// ---------- 头像/图片代理（防盗链 + SSRF 白名单 + SQLite 缓存） ----------
+const AVATAR_HOSTS = new Set(['wx.qlogo.cn', 'finder.video.qq.com']);
+const AVATAR_TTL = 86400;
+
+function avatarHostAllowed(host) {
+  return AVATAR_HOSTS.has(host) || host.endsWith('.qlogo.cn') || host.endsWith('.finder.video.qq.com');
+}
+
+async function handleAvatar(req, res, u) {
+  const url = u.searchParams.get('url') || '';
+  let host;
+  try { host = new URL(url).hostname; } catch { return sendJson(res, 400, { error: 'bad url' }); }
+  if (!avatarHostAllowed(host)) return sendJson(res, 403, { error: 'host not allowed' });
+  const now = Math.floor(Date.now() / 1000);
+  const cached = db.prepare('SELECT contentType, data, ts FROM avatar_cache WHERE url = ?').get(url);
+  if (cached && now - cached.ts < AVATAR_TTL) {
+    res.writeHead(200, { 'Content-Type': cached.contentType || 'image/jpeg', 'Cache-Control': 'public, max-age=86400' });
+    return res.end(cached.data);
+  }
+  try {
+    const r = await fetch(url, {
+      headers: { Referer: 'https://channels.weixin.qq.com/', 'User-Agent': UA },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) throw new Error(`upstream HTTP ${r.status}`);
+    const ct = (r.headers.get('content-type') || 'image/jpeg').split(';')[0];
+    const buf = Buffer.from(await r.arrayBuffer());
+    db.prepare(`INSERT INTO avatar_cache(url,contentType,data,ts) VALUES(?,?,?,?)
+      ON CONFLICT(url) DO UPDATE SET contentType=excluded.contentType, data=excluded.data, ts=excluded.ts`)
+      .run(url, ct, buf, now);
+    res.writeHead(200, { 'Content-Type': ct, 'Cache-Control': 'public, max-age=86400' });
+    res.end(buf);
+  } catch (e) {
+    if (cached) { // 上游挂了但有过期缓存，兜底返回
+      res.writeHead(200, { 'Content-Type': cached.contentType || 'image/jpeg' });
+      return res.end(cached.data);
+    }
+    sendJson(res, 502, { error: String(e && e.message || e) });
+  }
+}
+
+// ---------- 人工写操作（串行队列，间隔 >= 8s 模拟人工） ----------
+let writeQueue = Promise.resolve();
+let lastWriteAt = 0;
+function enqueueWrite(fn) {
+  const job = writeQueue.then(async () => {
+    const wait = 8000 - (Date.now() - lastWriteAt);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastWriteAt = Date.now();
+    return fn();
+  });
+  writeQueue = job.catch(() => { /* 不阻塞后续任务 */ });
+  return job;
+}
+
+function logSent(type, target, content, upstream) {
+  db.prepare('INSERT INTO sent_log(ts,type,target,content,upstream) VALUES(?,?,?,?,?)')
+    .run(Math.floor(Date.now() / 1000), type, target, content, JSON.stringify(upstream).slice(0, 2000));
+}
+
+async function replyToComment(commentId, content) {
+  const c = db.prepare('SELECT * FROM comments WHERE commentId = ?').get(commentId);
+  if (!c) throw new Error('评论不存在或未采集');
+  // 字段结构来自官方 interaction 微前端：replyCommentId=被回复评论，rootCommentId=一级评论，comment=被回复评论对象
+  const r = await api(`${CGI}/comment/create_comment`, {
+    exportId: c.exportId,
+    replyCommentId: commentId,
+    rootCommentId: c.rootCommentId || commentId,
+    content,
+    clientId: crypto.randomUUID(),
+    comment: {
+      commentId: c.commentId,
+      commentNickname: c.nickname,
+      commentContent: c.content,
+      commentHeadurl: c.headUrl,
+      commentCreatetime: String(c.createTime),
+      commentLikeCount: c.likeCount,
+    },
+  });
+  logSent('comment_reply', commentId, content, r);
+  if (r.errCode !== 0) {
+    cookieValid = false;
+    throw new Error(`create_comment errCode=${r.errCode} errMsg=${r.errMsg || ''} baseResp=${JSON.stringify(r.data?.baseResp || {})}`);
+  }
+  const baseResp = r.data?.baseResp;
+  if (baseResp && baseResp.errcode) {
+    throw new Error(`create_comment baseResp.errcode=${baseResp.errcode}（-4300=需要手机验证）`);
+  }
+  // 局部重采该视频评论
+  const rr = { comments: 0 };
+  await collectCommentsForVideo(c.exportId, rr);
+  return { upstream: r, recollected: rr.comments };
+}
+
+let selfUsername = null;
+async function getSelfUsername() {
+  if (selfUsername) return selfUsername;
+  const r = await api(`${CGI}/private-msg/get-finder-username`, {});
+  if (r.errCode === 0 && r.data?.finderUsername) {
+    selfUsername = String(r.data.finderUsername);
+    return selfUsername;
+  }
+  // 兜底：从已采集消息里推自己的 v2_ ID
+  const row = db.prepare("SELECT toUsername AS u FROM dm_messages WHERE toUsername LIKE 'v2_%@finder' LIMIT 1").get();
+  if (row) { selfUsername = row.u; return selfUsername; }
+  throw new Error(`get-finder-username 失败: ${JSON.stringify(r).slice(0, 200)}`);
+}
+
+async function sendDM(sessionId, content) {
+  const s = db.prepare('SELECT * FROM dm_sessions WHERE sessionId = ?').get(sessionId);
+  if (!s) throw new Error('会话不存在或未采集');
+  const from = await getSelfUsername();
+  const r = await api(`${CGI}/private-msg/send-private-msg`, {
+    msgPack: {
+      sessionId,
+      fromUsername: from,
+      toUsername: s.username,
+      msgType: 1, // BYP_TEXT
+      textMsg: { content },
+      cliMsgId: crypto.randomUUID(),
+    },
+  });
+  logSent('dm_send', sessionId, content, r);
+  if (r.errCode !== 0) {
+    cookieValid = false;
+    throw new Error(`send-private-msg errCode=${r.errCode} errMsg=${r.errMsg || ''}`);
+  }
+  const baseResp = r.data?.baseResp;
+  if (baseResp && baseResp.errcode) throw new Error(`send-private-msg baseResp.errcode=${baseResp.errcode}`);
+  // 局部重采该会话消息
+  const hm = await api(`${CGI}/private-msg/get-history-msg`, { sessionId, cookie: '' });
+  checkErr(hm, 'dm_history');
+  for (const m of hm.data?.msg || []) saveMessage(m);
+  return { upstream: r };
+}
+
 const routes = {
   'GET /api/status': (req, res) => {
     const { lastCollect, lastResult } = lastCollectInfo();
@@ -344,6 +507,36 @@ const routes = {
              v.title AS videoTitle, v.thumbUrl AS videoThumb
       FROM comments c LEFT JOIN videos v ON v.objectId = c.exportId
       ORDER BY c.createTime DESC LIMIT ?`).all(limit);
+    sendJson(res, 200, { list });
+  },
+  'GET /api/avatar': handleAvatar,
+  'GET /api/videos/with-comments': (req, res) => {
+    // 视频卡片按「最新一条评论时间」倒序；评论按时间正序，楼中楼挂在 root 下
+    const videos = db.prepare(`
+      SELECT v.objectId, v.title, v.thumbUrl, v.createTime, v.commentCount,
+             MAX(c.createTime) AS latestCommentTs
+      FROM videos v JOIN comments c ON c.exportId = v.objectId
+      GROUP BY v.objectId ORDER BY latestCommentTs DESC`).all();
+    const stmt = db.prepare('SELECT * FROM comments WHERE exportId = ? ORDER BY createTime ASC');
+    const list = videos.map((v) => {
+      const all = stmt.all(v.objectId);
+      const tops = all.filter((c) => !c.rootCommentId);
+      const topIds = new Set(tops.map((c) => c.commentId));
+      const byRoot = {};
+      const orphans = [];
+      for (const c of all) {
+        if (!c.rootCommentId) continue;
+        if (topIds.has(c.rootCommentId)) (byRoot[c.rootCommentId] = byRoot[c.rootCommentId] || []).push(c);
+        else orphans.push(c); // root 评论已不可见，楼中楼降级为顶级展示
+      }
+      return {
+        ...v,
+        comments: [
+          ...tops.map((c) => ({ ...c, replies: byRoot[c.commentId] || [] })),
+          ...orphans.map((c) => ({ ...c, replies: [] })),
+        ],
+      };
+    });
     sendJson(res, 200, { list });
   },
   'GET /api/dm/sessions': (req, res) => {
@@ -405,6 +598,30 @@ const server = http.createServer(async (req, res) => {
           'SELECT * FROM dm_messages WHERE sessionId = ? ORDER BY ts DESC LIMIT ?').all(sid, limit);
         rows.reverse();
         return sendJson(res, 200, { list: rows });
+      }
+      const mReply = pathname.match(/^\/api\/comments\/([^/]+)\/reply$/);
+      if (req.method === 'POST' && mReply) {
+        const body = await readBody(req);
+        const content = String(body.content || '').trim();
+        if (!content) return sendJson(res, 400, { ok: false, error: '内容为空' });
+        try {
+          const r = await enqueueWrite(() => replyToComment(decodeURIComponent(mReply[1]), content));
+          return sendJson(res, 200, { ok: true, ...r });
+        } catch (e) {
+          return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+        }
+      }
+      const mSend = pathname.match(/^\/api\/dm\/sessions\/([^/]+)\/send$/);
+      if (req.method === 'POST' && mSend) {
+        const body = await readBody(req);
+        const content = String(body.content || '').trim();
+        if (!content) return sendJson(res, 400, { ok: false, error: '内容为空' });
+        try {
+          const r = await enqueueWrite(() => sendDM(decodeURIComponent(mSend[1]), content));
+          return sendJson(res, 200, { ok: true, ...r });
+        } catch (e) {
+          return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+        }
       }
       return sendJson(res, 404, { error: 'unknown api' });
     }
