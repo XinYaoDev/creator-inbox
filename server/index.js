@@ -880,6 +880,46 @@ const routes = {
     sendJson(res, 200, { list });
   },
   'GET /api/avatar': handleAvatar,
+  // 视频列表（master-detail 左栏）：按「最新评论时间」倒序，可筛平台/只看有评论
+  'GET /api/videos': (req, res, u) => {
+    const platform = u.searchParams.get('platform') || '';
+    const hasComments = u.searchParams.get('hasComments') === '1';
+    const conds = [];
+    const args = [];
+    if (platform) { conds.push('v.platform = ?'); args.push(platform); }
+    if (hasComments) conds.push('(SELECT COUNT(*) FROM comments c WHERE c.platform = v.platform AND c.exportId = v.objectId) > 0');
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    const list = db.prepare(`
+      SELECT v.platform, v.objectId, v.title, v.thumbUrl, v.createTime, v.commentCount,
+        (SELECT MAX(c.createTime) FROM comments c WHERE c.platform = v.platform AND c.exportId = v.objectId) AS latestCommentTs,
+        (SELECT COUNT(*) FROM comments c WHERE c.platform = v.platform AND c.exportId = v.objectId) AS collectedComments
+      FROM videos v ${where}
+      ORDER BY COALESCE(latestCommentTs, 0) DESC, v.createTime DESC
+      LIMIT 500`).all(...args);
+    sendJson(res, 200, { list });
+  },
+  // 单个视频的评论树（master-detail 右栏）
+  'GET /api/video/comments': (req, res, u) => {
+    const platform = u.searchParams.get('platform') || 'wechat';
+    const objectId = u.searchParams.get('objectId') || '';
+    const all = db.prepare('SELECT * FROM comments WHERE platform = ? AND exportId = ? ORDER BY createTime ASC')
+      .all(platform, objectId);
+    const tops = all.filter((c) => !c.rootCommentId);
+    const topIds = new Set(tops.map((c) => c.commentId));
+    const byRoot = {};
+    const orphans = [];
+    for (const c of all) {
+      if (!c.rootCommentId) continue;
+      if (topIds.has(c.rootCommentId)) (byRoot[c.rootCommentId] = byRoot[c.rootCommentId] || []).push(c);
+      else orphans.push(c);
+    }
+    sendJson(res, 200, {
+      list: [
+        ...tops.map((c) => ({ ...c, replies: byRoot[c.commentId] || [] })),
+        ...orphans.map((c) => ({ ...c, replies: [] })),
+      ],
+    });
+  },
   'GET /api/videos/with-comments': (req, res, u) => {
     // 视频卡片按「最新一条评论时间」倒序；评论按时间正序，楼中楼挂在 root 下
     const platform = u.searchParams.get('platform') || '';

@@ -26,15 +26,15 @@ type CommentItem = {
   rootCommentId: string
   replies?: CommentItem[]
 }
-type VideoCard = {
+type VideoItem = {
   platform: string
   objectId: string
   title: string
   thumbUrl: string
   createTime: number
   commentCount: number
-  latestCommentTs: number
-  comments: CommentItem[]
+  latestCommentTs: number | null
+  collectedComments: number
 }
 type SessionItem = {
   platform: string
@@ -301,7 +301,10 @@ export default function App() {
   const [tab, setTab] = useState<'comments' | 'dm' | 'publish'>('comments')
   const [platform, setPlatform] = useState<'all' | 'wechat' | 'douyin'>('all')
   const [status, setStatus] = useState<Status | null>(null)
-  const [videos, setVideos] = useState<VideoCard[]>([])
+  const [videoList, setVideoList] = useState<VideoItem[]>([])
+  const [curVideo, setCurVideo] = useState<string | null>(null) // "platform:objectId"
+  const [videoComments, setVideoComments] = useState<CommentItem[]>([])
+  const [onlyWithComments, setOnlyWithComments] = useState(true)
   const [sessions, setSessions] = useState<SessionItem[]>([])
   const [cur, setCur] = useState<string | null>(null)
   const [msgs, setMsgs] = useState<MsgItem[]>([])
@@ -313,12 +316,45 @@ export default function App() {
   const load = useCallback(async () => {
     const st: Status = await fetch('/api/status').then((r) => r.json())
     setStatus(st)
-    const q = platform === 'all' ? '' : `?platform=${platform}`
-    const vs = await fetch(`/api/videos/with-comments${q}`).then((r) => r.json())
-    setVideos(vs.list || [])
+    const params = new URLSearchParams()
+    if (platform !== 'all') params.set('platform', platform)
+    if (onlyWithComments) params.set('hasComments', '1')
+    const vs = await fetch(`/api/videos?${params}`).then((r) => r.json())
+    const list: VideoItem[] = vs.list || []
+    setVideoList(list)
     const ss = await fetch('/api/dm/sessions').then((r) => r.json())
     setSessions(ss.list || [])
-  }, [platform])
+  }, [platform, onlyWithComments])
+
+  // 列表变化后，保持/重选当前视频
+  useEffect(() => {
+    if (!videoList.length) {
+      setCurVideo(null)
+      return
+    }
+    if (!curVideo || !videoList.some((v) => `${v.platform}:${v.objectId}` === curVideo)) {
+      setCurVideo(`${videoList[0].platform}:${videoList[0].objectId}`)
+    }
+  }, [videoList, curVideo])
+
+  const loadVideoComments = useCallback(async (key: string) => {
+    const [p, ...rest] = key.split(':')
+    const objectId = rest.join(':')
+    const d = await fetch(
+      `/api/video/comments?platform=${encodeURIComponent(p)}&objectId=${encodeURIComponent(objectId)}`,
+    ).then((r) => r.json())
+    setVideoComments(d.list || [])
+  }, [])
+
+  useEffect(() => {
+    if (curVideo) loadVideoComments(curVideo)
+    else setVideoComments([])
+  }, [curVideo, loadVideoComments])
+
+  const reloadCurrent = useCallback(async () => {
+    if (curVideo) await loadVideoComments(curVideo)
+    load()
+  }, [curVideo, loadVideoComments, load])
 
   const loadMsgs = useCallback(async (sid: string) => {
     const d = await fetch(`/api/dm/sessions/${encodeURIComponent(sid)}/messages`).then((r) => r.json())
@@ -425,39 +461,83 @@ export default function App() {
                 {p === 'all' ? '全部平台' : platformName(p)}
               </button>
             ))}
+            <label className="ptoggle">
+              <input
+                type="checkbox"
+                checked={onlyWithComments}
+                onChange={(e) => setOnlyWithComments(e.target.checked)}
+              />
+              只看有评论的
+            </label>
           </div>
-          <main className="videolist">
-            {videos.length === 0 && <div className="empty">暂无评论</div>}
-            {videos.map((v) => (
-              <section className="vcard" key={`${v.platform}:${v.objectId}`}>
-                <header className="vcard-head">
-                  {v.thumbUrl ? (
-                    <img className="vthumb" src={proxied(v.thumbUrl)} alt="" loading="lazy" />
-                  ) : (
-                    <div className="vthumb avatar-fallback">视频</div>
-                  )}
-                  <div className="vcard-info">
-                    <div className="vcard-title">
-                      <span className={`ptag ptag-${v.platform}`}>{platformName(v.platform)}</span>
-                      {v.title || '（无文案视频）'}
+          <main className="comments-layout">
+            <aside className="vlist">
+              {videoList.length === 0 && <div className="empty">暂无视频</div>}
+              {videoList.map((v) => {
+                const key = `${v.platform}:${v.objectId}`
+                return (
+                  <button
+                    key={key}
+                    className={key === curVideo ? 'vrow active' : 'vrow'}
+                    onClick={() => setCurVideo(key)}
+                  >
+                    {v.thumbUrl ? (
+                      <img className="vrow-thumb" src={proxied(v.thumbUrl)} alt="" loading="lazy" />
+                    ) : (
+                      <div className="vrow-thumb avatar-fallback">视频</div>
+                    )}
+                    <div className="vrow-main">
+                      <div className="vrow-title">
+                        <span className={`ptag ptag-${v.platform}`}>{platformName(v.platform)}</span>
+                        {v.title || '（无文案视频）'}
+                      </div>
+                      <div className="vrow-meta mono">
+                        {fmtTime(v.createTime)} · 评论 {v.commentCount}
+                      </div>
                     </div>
-                    <div className="vcard-meta mono">
-                      发布 {fmtTime(v.createTime)} · 评论 {v.commentCount}
-                    </div>
+                  </button>
+                )
+              })}
+            </aside>
+            <section className="vdetail">
+              {!curVideo && <div className="empty">选择左侧视频查看评论</div>}
+              {curVideo && (
+                <>
+                  {(() => {
+                    const v = videoList.find((x) => `${x.platform}:${x.objectId}` === curVideo)
+                    return v ? (
+                      <header className="vcard-head">
+                        {v.thumbUrl ? (
+                          <img className="vthumb" src={proxied(v.thumbUrl)} alt="" loading="lazy" />
+                        ) : (
+                          <div className="vthumb avatar-fallback">视频</div>
+                        )}
+                        <div className="vcard-info">
+                          <div className="vcard-title">
+                            <span className={`ptag ptag-${v.platform}`}>{platformName(v.platform)}</span>
+                            {v.title || '（无文案视频）'}
+                          </div>
+                          <div className="vcard-meta mono">
+                            发布 {fmtTime(v.createTime)} · 评论 {v.commentCount}
+                          </div>
+                        </div>
+                      </header>
+                    ) : null
+                  })()}
+                  <div className="vcomments">
+                    {videoComments.length === 0 && <div className="empty">暂无评论</div>}
+                    {videoComments.map((c) => (
+                      <div key={c.commentId}>
+                        <CommentRow c={c} onSent={reloadCurrent} />
+                        {(c.replies || []).map((r) => (
+                          <CommentRow key={r.commentId} c={r} indent onSent={reloadCurrent} />
+                        ))}
+                      </div>
+                    ))}
                   </div>
-                </header>
-                <div className="vcomments">
-                  {v.comments.map((c) => (
-                    <div key={c.commentId}>
-                      <CommentRow c={c} onSent={load} />
-                      {(c.replies || []).map((r) => (
-                        <CommentRow key={r.commentId} c={r} indent onSent={load} />
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              </section>
-            ))}
+                </>
+              )}
+            </section>
           </main>
         </>
       )}

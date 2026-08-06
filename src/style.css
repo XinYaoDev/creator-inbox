@@ -141,6 +141,28 @@ body {
 .pub-actions { display: flex; gap: 12px; align-items: center; }
 .pub-ok { border: 1px solid var(--ink); background: var(--yellow); padding: 8px 12px; font-size: 13px; }
 
+/* ---- 评论 master-detail ---- */
+.ptoggle { display: flex; align-items: center; gap: 4px; color: var(--gray); font-size: 13px; cursor: pointer; }
+.comments-layout { display: flex; border: 1px solid var(--line); margin-top: 12px; min-height: 480px; }
+.vlist { width: 300px; flex: none; border-right: 1px solid var(--line); overflow-y: auto; max-height: 75vh; }
+.vrow {
+  display: flex; gap: 10px; width: 100%; text-align: left;
+  border: none; border-bottom: 1px solid var(--line); background: none;
+  padding: 10px 12px; cursor: pointer; border-radius: 0; font: inherit; color: inherit;
+}
+.vrow:hover { background: #F2F2ED; }
+.vrow.active { background: var(--yellow); }
+.vrow-thumb { width: 48px; height: 64px; object-fit: cover; flex: none; background: var(--line); border-radius: 0; }
+.vrow-main { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: space-between; }
+.vrow-title {
+  font-size: 13px; font-weight: 700;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.vrow-meta { color: var(--gray); font-size: 12px; }
+.vrow.active .vrow-meta { color: var(--ink); }
+.vdetail { flex: 1; min-width: 0; overflow-y: auto; max-height: 75vh; }
+.vdetail .vcard-head { border-bottom: 1px solid var(--line); }
+
 /* ---- 平台筛选与标识 ---- */
 .pfilters { display: flex; gap: 8px; padding-top: 12px; }
 .pfilter {
