@@ -762,9 +762,17 @@ export default function App() {
   }, [load])
 
   const refresh = async () => {
+    if (busy) return
     setBusy(true)
     try {
       await fetch('/api/collect', { method: 'POST' })
+      // 异步采集：轮询 status 直到完成，不用干等整个请求
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 2000))
+        const st: Status = await fetch('/api/status').then((r) => r.json())
+        setStatus(st)
+        if (!st.collecting) break
+      }
       await load()
       await loadAccounts()
     } finally {

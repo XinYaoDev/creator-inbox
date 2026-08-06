@@ -328,7 +328,7 @@ async function wxCollectVideos(acc, result) {
   }
 }
 
-async function wxCollectCommentsForVideo(acc, objectId, result) {
+async function wxCollectCommentsForVideoOnce(acc, objectId, result) {
   let buff = '';
   const seen = new Set();
   for (let page = 0; page < 30; page++) {
@@ -348,10 +348,47 @@ async function wxCollectCommentsForVideo(acc, objectId, result) {
   }
 }
 
-async function wxCollectComments(acc, result) {
-  const vids = db.prepare("SELECT objectId FROM videos WHERE platform='wechat' AND accountId=? AND commentCount > 0")
-    .all(acc.id);
-  for (const { objectId } of vids) await wxCollectCommentsForVideo(acc, objectId, result);
+// 视频号有限流（errCode=-1 请求过于频繁）：带退避重试
+async function wxCollectCommentsForVideo(acc, objectId, result) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await wxCollectCommentsForVideoOnce(acc, objectId, result);
+    } catch (e) {
+      if (!String(e && e.message || e).includes('频繁') || attempt === 2) throw e;
+      await sleep(5000 * (attempt + 1));
+    }
+  }
+}
+
+// 小并发池：limit 路并行跑 tasks
+async function pool(limit, tasks) {
+  const queue = [...tasks];
+  const workers = Array.from({ length: Math.min(limit, queue.length) }, async () => {
+    while (queue.length) await queue.shift()();
+  });
+  await Promise.all(workers);
+}
+
+// 未读小红点信号（post_list onlyUnread=true）调研结论：该集合包含点赞/弹幕等所有未读互动，
+// 且在官方端被阅读前永不消失——作为增量候选会让集合永远很大。新评论一定会让 commentCount +1，
+// 所以增量采集只按评论数差值驱动，每 12 轮全量兜底漂移。
+
+async function wxCollectComments(acc, result, full, prevCounts) {
+  let targets;
+  if (full) {
+    targets = db.prepare("SELECT objectId FROM videos WHERE platform='wechat' AND accountId=? AND commentCount > 0")
+      .all(acc.id).map((r) => r.objectId);
+  } else {
+    // 增量：评论数变化 ∪ 从没采过评论的
+    const rows = db.prepare("SELECT objectId, commentCount FROM videos WHERE platform='wechat' AND accountId=? AND commentCount > 0")
+      .all(acc.id);
+    targets = rows
+      .filter((r) => prevCounts.get(r.objectId) !== r.commentCount)
+      .map((r) => r.objectId);
+    result.incremental = { total: rows.length, hit: targets.length };
+  }
+  // 2 路并发拉评论（视频号有限流，快了会吃「请求过于频繁」）
+  await pool(2, targets.map((objectId) => () => wxCollectCommentsForVideo(acc, objectId, result)));
 }
 
 async function wxCollectDM(acc, result) {
@@ -394,9 +431,13 @@ async function wxFetchProfile(acc) {
   }
 }
 
-async function wxCollect(acc, result) {
+async function wxCollect(acc, result, full) {
+  // 快照旧评论数（wxCollectVideos 会覆盖新值），用于增量比对
+  const prevCounts = new Map(
+    db.prepare("SELECT objectId, commentCount FROM videos WHERE platform='wechat' AND accountId=?")
+      .all(acc.id).map((r) => [r.objectId, r.commentCount]));
   await wxCollectVideos(acc, result);
-  await wxCollectComments(acc, result);
+  await wxCollectComments(acc, result, full, prevCounts);
   await wxCollectDM(acc, result);
   try { await wxFetchProfile(acc); } catch { /* 资料抓取失败不影响采集 */ }
 }
@@ -512,10 +553,18 @@ async function dyCollectCommentsForVideo(acc, awemeId, result) {
   }
 }
 
-async function dyCollectComments(acc, result) {
-  const vids = db.prepare("SELECT objectId FROM videos WHERE platform='douyin' AND accountId=? AND commentCount > 0")
-    .all(acc.id);
-  for (const { objectId } of vids) await dyCollectCommentsForVideo(acc, objectId, result);
+async function dyCollectComments(acc, result, full, prevCounts) {
+  let targets;
+  if (full) {
+    targets = db.prepare("SELECT objectId FROM videos WHERE platform='douyin' AND accountId=? AND commentCount > 0")
+      .all(acc.id).map((r) => r.objectId);
+  } else {
+    const rows = db.prepare("SELECT objectId, commentCount FROM videos WHERE platform='douyin' AND accountId=? AND commentCount > 0")
+      .all(acc.id);
+    targets = rows.filter((r) => prevCounts.get(r.objectId) !== r.commentCount).map((r) => r.objectId);
+    result.incremental = { total: rows.length, hit: targets.length };
+  }
+  await pool(4, targets.map((objectId) => () => dyCollectCommentsForVideo(acc, objectId, result)));
 }
 
 async function dyFetchProfile(acc) {
@@ -526,9 +575,12 @@ async function dyFetchProfile(acc) {
   }
 }
 
-async function dyCollect(acc, result) {
+async function dyCollect(acc, result, full) {
+  const prevCounts = new Map(
+    db.prepare("SELECT objectId, commentCount FROM videos WHERE platform='douyin' AND accountId=?")
+      .all(acc.id).map((r) => [r.objectId, r.commentCount]));
   await dyCollectVideos(acc, result);
-  await dyCollectComments(acc, result);
+  await dyCollectComments(acc, result, full, prevCounts);
   try { await dyFetchProfile(acc); } catch { /* 资料抓取失败不影响采集 */ }
   // 私信：抖音走 imapi.douyin.com IM 体系（需 IM token + 自定义头），逆向成本高，第二批再接入
 }
@@ -539,44 +591,58 @@ const COLLECTORS = { wechat: wxCollect, douyin: dyCollect };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let collecting = false;
+let collectRound = 0;
 async function collectAll(trigger = 'auto') {
   if (collecting) return { skipped: true, msg: '上一次采集尚未结束' };
   collecting = true;
+  collectRound++;
+  // 每 12 轮全量扫一次（捕捉删评论/编辑等漂移），启动时也全量
+  const full = trigger === 'startup' || collectRound % 12 === 1;
   const startedAt = Math.floor(Date.now() / 1000);
-  const result = { trigger, accounts: {}, errors: [] };
-  let first = true;
-  for (const acc of listAccounts()) {
-    const r = { videos: 0, comments: 0, sessions: 0, messages: 0 };
+  const result = { trigger, full, accounts: {}, errors: [] };
+  const all = listAccounts();
+  const active = [];
+  for (const acc of all) {
     const key = `${acc.id}:${acc.platform}:${acc.label || ''}`;
     if (!acc.cookie) {
-      r.skipped = '无 cookie，未采集';
-      result.accounts[key] = r;
-      continue;
+      result.accounts[key] = { videos: 0, comments: 0, sessions: 0, messages: 0, skipped: '无 cookie，未采集' };
+    } else if (!COLLECTORS[acc.platform]) {
+      result.accounts[key] = { videos: 0, comments: 0, sessions: 0, messages: 0, skipped: `平台 ${acc.platform} 无适配器` };
+    } else {
+      active.push(acc);
     }
-    const collect = COLLECTORS[acc.platform];
-    if (!collect) {
-      r.skipped = `平台 ${acc.platform} 无适配器`;
-      result.accounts[key] = r;
-      continue;
-    }
-    if (!first) await sleep(2500);
-    first = false;
-    try {
-      await collect(acc, r);
-      setCookieValid(acc.id, true);
-      r.ok = true;
-    } catch (e) {
-      r.ok = false;
-      r.error = String(e && e.message || e);
-      result.errors.push(`[${PLATFORMS[acc.platform]?.name || acc.platform}·${acc.label || acc.id}] ${r.error}`);
-    }
-    result.accounts[key] = r;
   }
+  // 平台并行；同平台账号串行（间隔 2.5s 防风控）
+  const byPlatform = new Map();
+  for (const acc of active) {
+    if (!byPlatform.has(acc.platform)) byPlatform.set(acc.platform, []);
+    byPlatform.get(acc.platform).push(acc);
+  }
+  await Promise.all([...byPlatform.entries()].map(async ([platform, accs]) => {
+    const collect = COLLECTORS[platform];
+    let first = true;
+    for (const acc of accs) {
+      const r = { videos: 0, comments: 0, sessions: 0, messages: 0 };
+      const key = `${acc.id}:${acc.platform}:${acc.label || ''}`;
+      if (!first) await sleep(2500);
+      first = false;
+      try {
+        await collect(acc, r, full);
+        setCookieValid(acc.id, true);
+        r.ok = true;
+      } catch (e) {
+        r.ok = false;
+        r.error = String(e && e.message || e);
+        result.errors.push(`[${PLATFORMS[acc.platform]?.name || acc.platform}·${acc.label || acc.id}] ${r.error}`);
+      }
+      result.accounts[key] = r;
+    }
+  }));
   result.ok = result.errors.length === 0;
   result.elapsedSec = Math.floor(Date.now() / 1000) - startedAt;
   db.prepare('INSERT INTO collect_log(ts,result) VALUES(?,?)').run(startedAt, JSON.stringify(result));
   collecting = false;
-  console.log(`[collect] ${trigger} ok=${result.ok}`, JSON.stringify(result));
+  console.log(`[collect] ${trigger} ok=${result.ok} full=${full}`, JSON.stringify(result));
   return result;
 }
 
@@ -1212,9 +1278,11 @@ const routes = {
     for (const s of list) s.unread = 0; // demo 不做真未读
     sendJson(res, 200, { list });
   },
-  'POST /api/collect': async (req, res) => {
-    const r = await collectAll('manual');
-    sendJson(res, 200, r);
+  // 异步触发：立即返回，前端轮询 /api/status 的 collecting 标志
+  'POST /api/collect': (req, res) => {
+    if (collecting) return sendJson(res, 200, { started: false, msg: '上一次采集尚未结束' });
+    collectAll('manual').catch(console.error);
+    sendJson(res, 200, { started: true });
   },
   // ---------- 扫码登录 ----------
   'POST /api/login/start': async (req, res) => {
