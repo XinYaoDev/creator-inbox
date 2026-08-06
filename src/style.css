@@ -125,6 +125,22 @@ body {
 
 .send-err { color: var(--ink); background: var(--yellow); padding: 0 6px; font-size: 12px; }
 
+/* ---- 发表（存草稿） ---- */
+.pubform { padding-top: 20px; display: flex; flex-direction: column; gap: 16px; max-width: 720px; }
+.pub-block { display: flex; flex-direction: column; gap: 6px; }
+.pub-label { color: var(--gray); font-size: 13px; }
+.pub-preview { display: flex; gap: 16px; }
+.pub-video { width: 200px; max-height: 360px; background: var(--ink); object-fit: contain; }
+.pub-side { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.pub-meta { color: var(--gray); font-size: 12px; }
+.pub-cover { width: 160px; border: 1px solid var(--line); }
+.pub-desc {
+  border: 1px solid var(--ink); background: var(--paper); padding: 8px 10px;
+  font: inherit; font-size: 13px; border-radius: 0; outline: none; resize: vertical;
+}
+.pub-actions { display: flex; gap: 12px; align-items: center; }
+.pub-ok { border: 1px solid var(--ink); background: var(--yellow); padding: 8px 12px; font-size: 13px; }
+
 /* ---- 平台筛选与标识 ---- */
 .pfilters { display: flex; gap: 8px; padding-top: 12px; }
 .pfilter {

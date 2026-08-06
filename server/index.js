@@ -8,6 +8,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
+const nodeCrypto = require('node:crypto');
 
 const PORT = Number(process.env.PORT || 8877);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'inbox.db');
@@ -501,6 +502,166 @@ async function collectAll(trigger = 'auto') {
   return result;
 }
 
+// ---------- 视频号视频上传（存草稿） ----------
+// 协议来自 finder-helper-web bundle 逆向：helper_upload_params 取凭证 →
+// finderassistance*.video.qq.com 四步分片上传（applyuploaddfs/uploadpartdfs/completepartuploaddfs）→ post_draft
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const CDN_CHUNK = 8 * 1024 * 1024;
+let wxUploadParamsCache = null;
+let wxCdnHosts = [];
+
+async function wxUploadParams(force = false) {
+  if (wxUploadParamsCache && !force) return wxUploadParamsCache;
+  const r = await wxApi('/cgi-bin/mmfinderassistant-bin/helper/helper_upload_params', {});
+  if (r.errCode !== 0) {
+    PLATFORMS.wechat.cookieValid = false;
+    throw new Error(`helper_upload_params errCode=${r.errCode} errMsg=${r.errMsg || ''}`);
+  }
+  wxUploadParamsCache = r.data;
+  try {
+    const a = await wxApi('/cgi-bin/mmfinderassistant-bin/auth/auth_data', {});
+    const hosts = a?.data?.envInfo?.cdnHostList;
+    if (Array.isArray(hosts) && hosts.length) wxCdnHosts = hosts;
+  } catch { /* 用默认 host */ }
+  if (!wxCdnHosts.length) wxCdnHosts = ['finderassistancea.video.qq.com'];
+  return wxUploadParamsCache;
+}
+
+function cdnUploadHeaders(params, fileName, fileSize, taskId, fileTypeKey, md5) {
+  return {
+    Authorization: params.authKey,
+    'X-Arguments':
+      `apptype=${params.appType}&filetype=${params[fileTypeKey]}` +
+      `&weixinnum=${params.uin}&filekey=${encodeURIComponent(fileName)}` +
+      `&filesize=${fileSize}&taskid=${taskId}&scene=${params.scene || 0}`,
+    'Content-MD5': md5 || 'null',
+    'User-Agent': UA,
+  };
+}
+
+async function wxCdnUpload(filePath, fileName, params, fileTypeKey) {
+  const size = fs.statSync(filePath).size;
+  const taskId = crypto.randomUUID();
+  const chunkCount = Math.max(1, Math.ceil(size / CDN_CHUNK));
+  const host = () => `https://${wxCdnHosts[Math.floor(Math.random() * wxCdnHosts.length)]}`;
+  // 1. 初始化拿 UploadID
+  const initRes = await fetch(`${host()}/applyuploaddfs`, {
+    method: 'PUT',
+    headers: { ...cdnUploadHeaders(params, fileName, size, taskId, fileTypeKey), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      BlockSum: chunkCount,
+      BlockPartLength: Array.from({ length: chunkCount }, (_, i) => Math.min((i + 1) * CDN_CHUNK, size)),
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const initData = await initRes.json();
+  const uploadId = initData.UploadID || initData.data?.UploadID;
+  if (!uploadId) throw new Error(`applyuploaddfs 无 UploadID: ${JSON.stringify(initData).slice(0, 200)}`);
+  // 2. 逐片上传（QuickUpload=2 全程 Normal，不依赖秒传）
+  const fd = fs.openSync(filePath, 'r');
+  let transFlag = 0;
+  const partInfo = [];
+  try {
+    for (let i = 0; i < chunkCount; i++) {
+      const len = Math.min(CDN_CHUNK, size - i * CDN_CHUNK);
+      const chunk = Buffer.alloc(len);
+      fs.readSync(fd, chunk, 0, len, i * CDN_CHUNK);
+      const res = await fetch(
+        `${host()}/uploadpartdfs?PartNumber=${i + 1}&UploadID=${encodeURIComponent(uploadId)}&QuickUpload=2`,
+        {
+          method: 'PUT',
+          headers: {
+            ...cdnUploadHeaders(params, fileName, size, taskId, fileTypeKey,
+              nodeCrypto.createHash('md5').update(chunk).digest('hex')),
+            'Content-Type': 'application/octet-stream',
+          },
+          body: chunk,
+          signal: AbortSignal.timeout(180000),
+        });
+      const d = await res.json();
+      const errno = d['X-Errno'] ?? d.data?.['X-Errno'];
+      if (errno !== 0) throw new Error(`uploadpartdfs 第${i + 1}/${chunkCount}片 X-Errno=${errno}: ${JSON.stringify(d).slice(0, 200)}`);
+      if (d.TransFlag != null) transFlag = d.TransFlag;
+      partInfo.push({ PartNumber: i + 1, ETag: d.ETag ?? d.data?.ETag });
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  // 3. 完成
+  const finRes = await fetch(`${host()}/completepartuploaddfs?UploadID=${encodeURIComponent(uploadId)}`, {
+    method: 'POST',
+    headers: { ...cdnUploadHeaders(params, fileName, size, taskId, fileTypeKey), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ TransFlag: transFlag, PartInfo: partInfo }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const finData = await finRes.json();
+  const downloadURL = finData.DownloadURL || finData.data?.DownloadURL;
+  if (!downloadURL) throw new Error(`completepartuploaddfs 无 DownloadURL: ${JSON.stringify(finData).slice(0, 200)}`);
+  return {
+    url: downloadURL.replace('http://wxapp.tc.qq.com', 'https://finder.video.qq.com'),
+    taskId,
+    fileSize: size,
+  };
+}
+
+async function wxCreateVideoDraft({ videoPath, coverPath, description, width, height, duration }) {
+  const params = await wxUploadParams();
+  const video = await wxCdnUpload(videoPath, path.basename(videoPath), params, 'videoFileType');
+  let coverUrl = '';
+  if (coverPath && fs.existsSync(coverPath)) {
+    const cover = await wxCdnUpload(coverPath, path.basename(coverPath), params, 'pictureFileType');
+    coverUrl = cover.url;
+  }
+  const clientid = crypto.randomUUID();
+  const postReq = {
+    objectType: 0,
+    isFullPost: 1,
+    handleFlag: 2,
+    videoClipTaskId: '',
+    longitude: 0, latitude: 0, feedLongitude: 0, feedLatitude: 0,
+    originalFlag: 0, topics: [],
+    objectDesc: {
+      mpTitle: '',
+      description: String(description || ''),
+      extReading: { link: '', title: '' },
+      mediaType: 4,
+      location: {}, topic: { finderTopicInfo: '' }, event: {}, mentionedUser: [],
+      media: [{
+        url: video.url,
+        fileSize: video.fileSize,
+        thumbUrl: coverUrl,
+        fullThumbUrl: coverUrl,
+        mediaType: 4,
+        videoPlayLen: Math.round(Number(duration) || 0),
+        width: Number(width) || 0,
+        height: Number(height) || 0,
+        md5sum: video.taskId,
+        ...(coverUrl ? { coverUrl, fullCoverUrl: coverUrl } : {}),
+      }],
+    },
+    clientId: clientid,
+    clientid,
+  };
+  const r = await wxApi('/cgi-bin/mmfinderassistant-bin/post/post_draft', { postReq, objectId: null });
+  logSent('upload_draft', path.basename(videoPath), String(description || ''), r);
+  if (r.errCode !== 0) {
+    PLATFORMS.wechat.cookieValid = false;
+    throw new Error(`post_draft errCode=${r.errCode} errMsg=${r.errMsg || ''}`);
+  }
+  const baseResp = r.data?.baseResp;
+  if (baseResp && baseResp.errcode) throw new Error(`post_draft baseResp.errcode=${baseResp.errcode}`);
+  return { objectId: r.data?.objectId || '' };
+}
+
+// 上传串行队列（避免并发打 CDN）
+let uploadChain = Promise.resolve();
+function enqueueUpload(fn) {
+  const job = uploadChain.then(fn);
+  uploadChain = job.catch(() => { /* 不阻塞后续任务 */ });
+  return job;
+}
+
 // ---------- HTTP ----------
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -804,6 +965,57 @@ const server = http.createServer(async (req, res) => {
     if (pathname.startsWith('/api/')) {
       const key = `${req.method} ${pathname}`;
       if (routes[key]) return await routes[key](req, res, u);
+      // 上传文件（原始字节流，非 multipart）：?kind=video|cover&filename=xx.mp4
+      if (req.method === 'POST' && pathname === '/api/upload/file') {
+        const kind = u.searchParams.get('kind') === 'cover' ? 'cover' : 'video';
+        const rawName = u.searchParams.get('filename') || (kind === 'cover' ? 'cover.jpg' : 'video.mp4');
+        const safeName = path.basename(rawName).replace(/[^\w.一-龥-]+/g, '_').slice(-80);
+        const id = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}-${safeName}`;
+        const dest = path.join(UPLOAD_DIR, id);
+        try {
+          await new Promise((resolve, reject) => {
+            const ws = fs.createWriteStream(dest);
+            req.pipe(ws);
+            ws.on('finish', resolve);
+            ws.on('error', reject);
+            req.on('error', reject);
+          });
+        } catch (e) {
+          try { fs.unlinkSync(dest); } catch { /* ignore */ }
+          return sendJson(res, 500, { ok: false, error: String(e && e.message || e) });
+        }
+        const size = fs.statSync(dest).size;
+        if (!size) {
+          fs.unlinkSync(dest);
+          return sendJson(res, 400, { ok: false, error: '空文件' });
+        }
+        return sendJson(res, 200, { ok: true, id, fileSize: size });
+      }
+      if (req.method === 'POST' && pathname === '/api/upload/draft') {
+        const body = await readBody(req);
+        const cleanId = (s) => path.basename(String(s || ''));
+        const videoId = cleanId(body.videoId);
+        const coverId = cleanId(body.coverId);
+        if (!videoId) return sendJson(res, 400, { ok: false, error: '缺少 videoId' });
+        const videoPath = path.join(UPLOAD_DIR, videoId);
+        if (!videoPath.startsWith(UPLOAD_DIR) || !fs.existsSync(videoPath)) {
+          return sendJson(res, 400, { ok: false, error: '视频文件不存在，请先上传' });
+        }
+        const coverPath = coverId ? path.join(UPLOAD_DIR, coverId) : '';
+        try {
+          const r = await enqueueUpload(() => wxCreateVideoDraft({
+            videoPath,
+            coverPath: coverPath.startsWith(UPLOAD_DIR) ? coverPath : '',
+            description: body.description,
+            width: body.width,
+            height: body.height,
+            duration: body.duration,
+          }));
+          return sendJson(res, 200, { ok: true, ...r });
+        } catch (e) {
+          return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+        }
+      }
       const m = pathname.match(/^\/api\/dm\/sessions\/([^/]+)\/messages$/) ;
       if (req.method === 'GET' && m) {
         const sid = decodeURIComponent(m[1]);
@@ -850,6 +1062,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
+  // 上传大文件耗时长，放宽请求超时
+  server.requestTimeout = 0;
+  server.headersTimeout = 120000;
   console.log(`[inbox] listening on :${PORT}, db=${DB_PATH}, static=${STATIC_DIR}`);
   collectAll('startup');
   setInterval(() => { collectAll('interval').catch(console.error); }, 5 * 60 * 1000);
