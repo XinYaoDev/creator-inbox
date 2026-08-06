@@ -115,6 +115,13 @@ body {
   cursor: pointer; padding: 0; border-radius: 0;
 }
 .linkbtn:hover { color: var(--ink); text-decoration: underline; }
+.linkbtn.danger { color: var(--paper); background: var(--ink); padding: 0 6px; }
+.acct-cookie { padding: 8px 0 8px 8px; display: flex; flex-direction: column; gap: 8px; }
+.acct-cookie textarea {
+  border: 1px solid var(--ink); background: var(--paper); padding: 8px 10px;
+  font: inherit; font-size: 12px; border-radius: 0; outline: none; resize: vertical;
+  font-family: ui-monospace, Menlo, monospace;
+}
 
 .replybox { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 .replybox input, .sendbox input {

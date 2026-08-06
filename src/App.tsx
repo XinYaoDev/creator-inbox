@@ -401,11 +401,13 @@ function AccountsTab({
     } else toast(r.error || '创建失败')
   }
 
-  const updateCookie = async (acc: Account) => {
-    const hint = acc.platform === 'wechat'
-      ? '视频号助手（channels.weixin.qq.com）DevTools → Network → 任意请求 → Cookie 整行'
-      : '抖音创作者中心（creator.douyin.com）DevTools → Network → 任意请求 → Cookie 整行'
-    const cookie = window.prompt(`粘贴 ${acc.label || acc.platformName} 的 Cookie：\n${hint}`)
+  // Tauri/WKWebView 不支持 window.confirm/prompt，全部改用内联 UI
+  const [cookieFor, setCookieFor] = useState<number | null>(null)
+  const [cookieText, setCookieText] = useState('')
+  const [confirmDel, setConfirmDel] = useState<string | null>(null)
+
+  const saveCookie = async (acc: Account) => {
+    const cookie = cookieText.trim()
     if (!cookie) return
     const r = await fetch(`/api/accounts/${acc.id}/cookie`, {
       method: 'POST',
@@ -413,19 +415,31 @@ function AccountsTab({
       body: JSON.stringify({ cookie }),
     }).then((x) => x.json())
     if (r.ok) {
+      setCookieFor(null)
+      setCookieText('')
       onChanged()
       toast('Cookie 已更新，下次采集生效')
     } else toast(r.error || '更新失败')
   }
 
   const delAccount = async (acc: Account) => {
-    if (!window.confirm(`删除账号「${acc.label || acc.id}」？已采集的评论/私信会保留但不再更新。`)) return
+    const key = `acc:${acc.id}`
+    if (confirmDel !== key) {
+      setConfirmDel(key)
+      return
+    }
+    setConfirmDel(null)
     await fetch(`/api/accounts/${acc.id}`, { method: 'DELETE' })
     onChanged()
   }
 
   const delGroup = async (g: Group) => {
-    if (!window.confirm(`删除分组「${g.name}」？`)) return
+    const key = `grp:${g.id}`
+    if (confirmDel !== key) {
+      setConfirmDel(key)
+      return
+    }
+    setConfirmDel(null)
     const r = await fetch(`/api/groups/${g.id}`, { method: 'DELETE' }).then((x) => x.json())
     if (!r.ok) toast(r.error || '删除失败')
     onChanged()
@@ -449,28 +463,66 @@ function AccountsTab({
         <section className="acct-group" key={g.id}>
           <header className="acct-group-head">
             <b>{g.name}</b>
-            <button className="linkbtn" onClick={() => delGroup(g)}>删除分组</button>
+            <button
+              className={confirmDel === `grp:${g.id}` ? 'linkbtn danger' : 'linkbtn'}
+              onClick={() => delGroup(g)}
+            >
+              {confirmDel === `grp:${g.id}` ? '确认删除分组？' : '删除分组'}
+            </button>
           </header>
           {(accounts.filter((a) => a.groupId === g.id)).map((a) => (
-            <div className="acct-row" key={a.id}>
-              <span className={`ptag ptag-${a.platform}`}>{a.platformName}</span>
-              <span className="acct-label">{a.label || `账号${a.id}`}</span>
-              <span className="acct-status">
-                Cookie{' '}
-                {!a.hasCookie ? (
-                  <b className="bad">未配置</b>
-                ) : a.cookieValid == null ? (
-                  <b>未知</b>
-                ) : a.cookieValid ? (
-                  <b className="ok">有效</b>
-                ) : (
-                  <b className="bad">已失效</b>
-                )}
-              </span>
-              <button className="linkbtn" onClick={() => updateCookie(a)}>
-                {a.hasCookie ? '更新Cookie' : '登录（粘贴Cookie）'}
-              </button>
-              <button className="linkbtn" onClick={() => delAccount(a)}>删除</button>
+            <div key={a.id}>
+              <div className="acct-row">
+                <span className={`ptag ptag-${a.platform}`}>{a.platformName}</span>
+                <span className="acct-label">{a.label || `账号${a.id}`}</span>
+                <span className="acct-status">
+                  Cookie{' '}
+                  {!a.hasCookie ? (
+                    <b className="bad">未配置</b>
+                  ) : a.cookieValid == null ? (
+                    <b>未知</b>
+                  ) : a.cookieValid ? (
+                    <b className="ok">有效</b>
+                  ) : (
+                    <b className="bad">已失效</b>
+                  )}
+                </span>
+                <button
+                  className="linkbtn"
+                  onClick={() => {
+                    setCookieFor(cookieFor === a.id ? null : a.id)
+                    setCookieText('')
+                  }}
+                >
+                  {cookieFor === a.id ? '收起' : a.hasCookie ? '更新Cookie' : '登录（粘贴Cookie）'}
+                </button>
+                <button
+                  className={confirmDel === `acc:${a.id}` ? 'linkbtn danger' : 'linkbtn'}
+                  onClick={() => delAccount(a)}
+                >
+                  {confirmDel === `acc:${a.id}` ? '确认删除？' : '删除'}
+                </button>
+              </div>
+              {cookieFor === a.id && (
+                <div className="acct-cookie">
+                  <textarea
+                    rows={3}
+                    value={cookieText}
+                    onChange={(e) => setCookieText(e.target.value)}
+                    placeholder={
+                      a.platform === 'wechat'
+                        ? '视频号助手（channels.weixin.qq.com）DevTools → Network → 任意请求 → Cookie 请求头整行粘贴到这里'
+                        : '抖音创作者中心（creator.douyin.com）DevTools → Network → 任意请求 → Cookie 请求头整行粘贴到这里'
+                    }
+                  />
+                  <div className="pub-actions">
+                    <button className="btn" onClick={() => saveCookie(a)} disabled={!cookieText.trim()}>
+                      保存
+                    </button>
+                    <button className="linkbtn" onClick={() => setCookieFor(null)}>取消</button>
+                  </div>
+                </div>
+              )}
             </div>
           ))}
           <div className="acct-add">
