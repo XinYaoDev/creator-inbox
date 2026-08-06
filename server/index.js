@@ -889,12 +889,16 @@ const routes = {
     if (platform) { conds.push('v.platform = ?'); args.push(platform); }
     if (hasComments) conds.push('(SELECT COUNT(*) FROM comments c WHERE c.platform = v.platform AND c.exportId = v.objectId) > 0');
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    const sort = u.searchParams.get('sort') === 'time' ? 'time' : 'comment';
+    const orderBy = sort === 'time'
+      ? 'v.createTime DESC'
+      : 'COALESCE(latestCommentTs, 0) DESC, v.createTime DESC';
     const list = db.prepare(`
       SELECT v.platform, v.objectId, v.title, v.thumbUrl, v.createTime, v.commentCount,
         (SELECT MAX(c.createTime) FROM comments c WHERE c.platform = v.platform AND c.exportId = v.objectId) AS latestCommentTs,
         (SELECT COUNT(*) FROM comments c WHERE c.platform = v.platform AND c.exportId = v.objectId) AS collectedComments
       FROM videos v ${where}
-      ORDER BY COALESCE(latestCommentTs, 0) DESC, v.createTime DESC
+      ORDER BY ${orderBy}
       LIMIT 500`).all(...args);
     sendJson(res, 200, { list });
   },

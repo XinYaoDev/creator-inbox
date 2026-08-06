@@ -305,6 +305,7 @@ export default function App() {
   const [curVideo, setCurVideo] = useState<string | null>(null) // "platform:objectId"
   const [videoComments, setVideoComments] = useState<CommentItem[]>([])
   const [onlyWithComments, setOnlyWithComments] = useState(true)
+  const [videoSort, setVideoSort] = useState<'comment' | 'time'>('comment')
   const [sessions, setSessions] = useState<SessionItem[]>([])
   const [cur, setCur] = useState<string | null>(null)
   const [msgs, setMsgs] = useState<MsgItem[]>([])
@@ -319,12 +320,13 @@ export default function App() {
     const params = new URLSearchParams()
     if (platform !== 'all') params.set('platform', platform)
     if (onlyWithComments) params.set('hasComments', '1')
+    params.set('sort', videoSort)
     const vs = await fetch(`/api/videos?${params}`).then((r) => r.json())
     const list: VideoItem[] = vs.list || []
     setVideoList(list)
     const ss = await fetch('/api/dm/sessions').then((r) => r.json())
     setSessions(ss.list || [])
-  }, [platform, onlyWithComments])
+  }, [platform, onlyWithComments, videoSort])
 
   // 列表变化后，保持/重选当前视频
   useEffect(() => {
@@ -469,6 +471,22 @@ export default function App() {
               />
               只看有评论的
             </label>
+            <span className="psort">
+              {(
+                [
+                  ['comment', '按最新评论'],
+                  ['time', '按发布时间'],
+                ] as const
+              ).map(([k, label]) => (
+                <button
+                  key={k}
+                  className={videoSort === k ? 'pfilter active' : 'pfilter'}
+                  onClick={() => setVideoSort(k)}
+                >
+                  {label}
+                </button>
+              ))}
+            </span>
           </div>
           <main className="comments-layout">
             <aside className="vlist">

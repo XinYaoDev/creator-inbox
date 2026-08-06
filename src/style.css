@@ -143,6 +143,7 @@ body {
 
 /* ---- 评论 master-detail ---- */
 .ptoggle { display: flex; align-items: center; gap: 4px; color: var(--gray); font-size: 13px; cursor: pointer; }
+.psort { margin-left: auto; display: flex; gap: 8px; }
 .comments-layout { display: flex; border: 1px solid var(--line); margin-top: 12px; min-height: 480px; }
 .vlist { width: 300px; flex: none; border-right: 1px solid var(--line); overflow-y: auto; max-height: 75vh; }
 .vrow {
