@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-type PlatformInfo = { name: string; cookieValid: boolean | null; hasCookie: boolean }
+type PlatformInfo = { name: string; cookieValid: boolean | null; hasCookie: boolean; accountCount: number }
 type Status = {
   lastCollect: number | null
   collecting: boolean
@@ -14,8 +14,19 @@ type Status = {
     byPlatform: Record<string, { videos: number; comments: number }>
   }
 }
+type Group = { id: number; name: string; createdAt: number }
+type Account = {
+  id: number
+  groupId: number
+  platform: string
+  platformName: string
+  label: string
+  hasCookie: boolean
+  cookieValid: boolean | null
+}
 type CommentItem = {
   platform: string
+  accountId: number
   commentId: string
   exportId: string
   nickname: string
@@ -28,6 +39,7 @@ type CommentItem = {
 }
 type VideoItem = {
   platform: string
+  accountId: number
   objectId: string
   title: string
   thumbUrl: string
@@ -38,6 +50,7 @@ type VideoItem = {
 }
 type SessionItem = {
   platform: string
+  accountId: number
   sessionId: string
   username: string
   nickname: string
@@ -49,6 +62,8 @@ type SessionItem = {
   unread: number
 }
 type MsgItem = {
+  platform: string
+  accountId: number
   svrMsgId: string
   sessionId: string
   fromUsername: string
@@ -137,15 +152,17 @@ function CommentRow({ c, indent, onSent }: { c: CommentItem; indent?: boolean; o
   )
 }
 
-function PublishTab() {
+function PublishTab({ groups, accounts }: { groups: Group[]; accounts: Account[] }) {
   const [file, setFile] = useState<File | null>(null)
   const [videoUrl, setVideoUrl] = useState('')
   const [meta, setMeta] = useState<{ width: number; height: number; duration: number } | null>(null)
   const [cover, setCover] = useState<Blob | null>(null)
   const [coverUrl, setCoverUrl] = useState('')
   const [desc, setDesc] = useState('')
+  const [targetMode, setTargetMode] = useState<'group' | 'account'>('group')
+  const [targetId, setTargetId] = useState<number>(0)
   const [stage, setStage] = useState('')
-  const [result, setResult] = useState('')
+  const [results, setResults] = useState<{ label: string; platform: string; ok: boolean; error?: string; objectId?: string }[]>([])
   const [err, setErr] = useState('')
   const videoRef = useRef<HTMLVideoElement>(null)
 
@@ -153,7 +170,7 @@ function PublishTab() {
     setMeta(null)
     setCover(null)
     setCoverUrl('')
-    setResult('')
+    setResults([])
     setErr('')
   }
 
@@ -198,8 +215,12 @@ function PublishTab() {
 
   const submit = async () => {
     if (!file || !meta || stage) return
+    if (!targetId) {
+      setErr(targetMode === 'group' ? '请选择分组' : '请选择账号')
+      return
+    }
     setErr('')
-    setResult('')
+    setResults([])
     try {
       setStage('上传视频到服务器…')
       const up = await fetch(`/api/upload/file?kind=video&filename=${encodeURIComponent(file.name)}`, {
@@ -216,7 +237,7 @@ function PublishTab() {
         }).then((r) => r.json())
         if (cu.ok) coverId = cu.id
       }
-      setStage('分片上传到视频号 CDN 并存草稿（大文件需几分钟）…')
+      setStage('分片上传到视频号 CDN 并存草稿（多账号逐个执行，需几分钟）…')
       const dr = await fetch('/api/upload/draft', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -224,17 +245,19 @@ function PublishTab() {
           videoId: up.id,
           coverId,
           description: desc.trim(),
+          ...(targetMode === 'group' ? { groupId: targetId } : { accountId: targetId }),
           ...meta,
         }),
       }).then((r) => r.json())
-      if (!dr.ok) throw new Error(dr.error || '存草稿失败')
-      setResult(`草稿已创建，去视频号助手「内容管理 → 草稿箱」查看/发表（${dr.objectId.slice(0, 24)}…）`)
+      setResults(dr.results || [])
       setStage('')
     } catch (e) {
       setErr(String((e as Error)?.message || e))
       setStage('')
     }
   }
+
+  const wxAccounts = accounts.filter((a) => a.platform === 'wechat')
 
   return (
     <main className="pubform">
@@ -286,47 +309,236 @@ function PublishTab() {
           placeholder="视频描述…"
         />
       </div>
+      <div className="pub-block">
+        <div className="pub-label">发表目标（仅视频号账号会执行，抖音上传暂未接入）</div>
+        <div className="pub-target">
+          <select value={targetMode} onChange={(e) => { setTargetMode(e.target.value as 'group' | 'account'); setTargetId(0) }}>
+            <option value="group">整组</option>
+            <option value="account">单个账号</option>
+          </select>
+          {targetMode === 'group' ? (
+            <select value={targetId} onChange={(e) => setTargetId(Number(e.target.value))}>
+              <option value={0}>选择分组…</option>
+              {groups.map((g) => (
+                <option key={g.id} value={g.id}>{g.name}</option>
+              ))}
+            </select>
+          ) : (
+            <select value={targetId} onChange={(e) => setTargetId(Number(e.target.value))}>
+              <option value={0}>选择账号…</option>
+              {wxAccounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.label || `账号${a.id}`}（{a.platformName}）
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      </div>
       <div className="pub-actions">
         <button className="btn" onClick={submit} disabled={!file || !meta || Boolean(stage)}>
           {stage || '存为草稿'}
         </button>
       </div>
-      {result && <div className="pub-ok">{result}</div>}
+      {results.length > 0 && (
+        <div className="pub-results">
+          {results.map((r, i) => (
+            <div key={i} className={r.ok ? 'pub-ok' : 'send-err'}>
+              {r.label || `账号${i + 1}`}：{r.ok ? `草稿已创建（${(r.objectId || '').slice(0, 20)}…）` : r.error}
+            </div>
+          ))}
+        </div>
+      )}
       {err && <div className="send-err">{err}</div>}
     </main>
   )
 }
 
+function AccountsTab({
+  groups,
+  accounts,
+  onChanged,
+}: {
+  groups: Group[]
+  accounts: Account[]
+  onChanged: () => void
+}) {
+  const [newGroup, setNewGroup] = useState('')
+  const [newLabel, setNewLabel] = useState<Record<number, string>>({})
+  const [newPlatform, setNewPlatform] = useState<Record<number, string>>({})
+  const [msg, setMsg] = useState('')
+
+  const toast = (s: string) => {
+    setMsg(s)
+    setTimeout(() => setMsg(''), 3000)
+  }
+
+  const addGroup = async () => {
+    if (!newGroup.trim()) return
+    const r = await fetch('/api/groups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newGroup.trim() }),
+    }).then((x) => x.json())
+    if (r.ok) {
+      setNewGroup('')
+      onChanged()
+    } else toast(r.error || '创建失败')
+  }
+
+  const addAccount = async (groupId: number) => {
+    const platform = newPlatform[groupId] || 'wechat'
+    const label = (newLabel[groupId] || '').trim()
+    const r = await fetch('/api/accounts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groupId, platform, label }),
+    }).then((x) => x.json())
+    if (r.ok) {
+      setNewLabel({ ...newLabel, [groupId]: '' })
+      onChanged()
+      toast('账号已创建，请更新 Cookie 完成登录')
+    } else toast(r.error || '创建失败')
+  }
+
+  const updateCookie = async (acc: Account) => {
+    const hint = acc.platform === 'wechat'
+      ? '视频号助手（channels.weixin.qq.com）DevTools → Network → 任意请求 → Cookie 整行'
+      : '抖音创作者中心（creator.douyin.com）DevTools → Network → 任意请求 → Cookie 整行'
+    const cookie = window.prompt(`粘贴 ${acc.label || acc.platformName} 的 Cookie：\n${hint}`)
+    if (!cookie) return
+    const r = await fetch(`/api/accounts/${acc.id}/cookie`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookie }),
+    }).then((x) => x.json())
+    if (r.ok) {
+      onChanged()
+      toast('Cookie 已更新，下次采集生效')
+    } else toast(r.error || '更新失败')
+  }
+
+  const delAccount = async (acc: Account) => {
+    if (!window.confirm(`删除账号「${acc.label || acc.id}」？已采集的评论/私信会保留但不再更新。`)) return
+    await fetch(`/api/accounts/${acc.id}`, { method: 'DELETE' })
+    onChanged()
+  }
+
+  const delGroup = async (g: Group) => {
+    if (!window.confirm(`删除分组「${g.name}」？`)) return
+    const r = await fetch(`/api/groups/${g.id}`, { method: 'DELETE' }).then((x) => x.json())
+    if (!r.ok) toast(r.error || '删除失败')
+    onChanged()
+  }
+
+  return (
+    <main className="acct">
+      <div className="acct-addgroup">
+        <input
+          value={newGroup}
+          onChange={(e) => setNewGroup(e.target.value)}
+          placeholder="新分组名，如：妈妈账号"
+          onKeyDown={(e) => e.key === 'Enter' && addGroup()}
+        />
+        <button className="btn" onClick={addGroup} disabled={!newGroup.trim()}>
+          创建分组
+        </button>
+        {msg && <span className="pub-ok">{msg}</span>}
+      </div>
+      {groups.map((g) => (
+        <section className="acct-group" key={g.id}>
+          <header className="acct-group-head">
+            <b>{g.name}</b>
+            <button className="linkbtn" onClick={() => delGroup(g)}>删除分组</button>
+          </header>
+          {(accounts.filter((a) => a.groupId === g.id)).map((a) => (
+            <div className="acct-row" key={a.id}>
+              <span className={`ptag ptag-${a.platform}`}>{a.platformName}</span>
+              <span className="acct-label">{a.label || `账号${a.id}`}</span>
+              <span className="acct-status">
+                Cookie{' '}
+                {!a.hasCookie ? (
+                  <b className="bad">未配置</b>
+                ) : a.cookieValid == null ? (
+                  <b>未知</b>
+                ) : a.cookieValid ? (
+                  <b className="ok">有效</b>
+                ) : (
+                  <b className="bad">已失效</b>
+                )}
+              </span>
+              <button className="linkbtn" onClick={() => updateCookie(a)}>
+                {a.hasCookie ? '更新Cookie' : '登录（粘贴Cookie）'}
+              </button>
+              <button className="linkbtn" onClick={() => delAccount(a)}>删除</button>
+            </div>
+          ))}
+          <div className="acct-add">
+            <select
+              value={newPlatform[g.id] || 'wechat'}
+              onChange={(e) => setNewPlatform({ ...newPlatform, [g.id]: e.target.value })}
+            >
+              <option value="wechat">视频号</option>
+              <option value="douyin">抖音</option>
+            </select>
+            <input
+              value={newLabel[g.id] || ''}
+              onChange={(e) => setNewLabel({ ...newLabel, [g.id]: e.target.value })}
+              placeholder="账号备注名，如：妈妈的视频号"
+            />
+            <button className="btn" onClick={() => addAccount(g.id)}>添加账号</button>
+          </div>
+        </section>
+      ))}
+      <div className="pub-label">
+        登录方式：添加账号后点「登录」，粘贴对应平台网页版的 Cookie（DevTools → Network → 任意请求的 Cookie
+        请求头整行）。内置扫码登录面板规划中。
+      </div>
+    </main>
+  )
+}
+
 export default function App() {
-  const [tab, setTab] = useState<'comments' | 'dm' | 'publish'>('comments')
+  const [tab, setTab] = useState<'comments' | 'dm' | 'publish' | 'accounts'>('comments')
   const [platform, setPlatform] = useState<'all' | 'wechat' | 'douyin'>('all')
+  const [groupFilter, setGroupFilter] = useState<'all' | number>('all')
   const [status, setStatus] = useState<Status | null>(null)
+  const [groups, setGroups] = useState<Group[]>([])
+  const [accounts, setAccounts] = useState<Account[]>([])
   const [videoList, setVideoList] = useState<VideoItem[]>([])
-  const [curVideo, setCurVideo] = useState<string | null>(null) // "platform:objectId"
+  const [curVideo, setCurVideo] = useState<string | null>(null) // "platform:accountId:objectId"
   const [videoComments, setVideoComments] = useState<CommentItem[]>([])
   const [onlyWithComments, setOnlyWithComments] = useState(true)
   const [videoSort, setVideoSort] = useState<'comment' | 'time'>('comment')
   const [sessions, setSessions] = useState<SessionItem[]>([])
-  const [cur, setCur] = useState<string | null>(null)
+  const [cur, setCur] = useState<string | null>(null) // "platform:accountId:sessionId"
   const [msgs, setMsgs] = useState<MsgItem[]>([])
   const [busy, setBusy] = useState(false)
   const [dmInput, setDmInput] = useState('')
   const [dmSending, setDmSending] = useState(false)
   const [dmErr, setDmErr] = useState('')
 
+  const loadAccounts = useCallback(async () => {
+    const d = await fetch('/api/accounts').then((r) => r.json())
+    setGroups(d.groups || [])
+    setAccounts(d.accounts || [])
+  }, [])
+
   const load = useCallback(async () => {
     const st: Status = await fetch('/api/status').then((r) => r.json())
     setStatus(st)
     const params = new URLSearchParams()
     if (platform !== 'all') params.set('platform', platform)
+    if (groupFilter !== 'all') params.set('groupId', String(groupFilter))
     if (onlyWithComments) params.set('hasComments', '1')
     params.set('sort', videoSort)
     const vs = await fetch(`/api/videos?${params}`).then((r) => r.json())
     const list: VideoItem[] = vs.list || []
     setVideoList(list)
-    const ss = await fetch('/api/dm/sessions').then((r) => r.json())
+    const sq = groupFilter !== 'all' ? `?groupId=${groupFilter}` : ''
+    const ss = await fetch(`/api/dm/sessions${sq}`).then((r) => r.json())
     setSessions(ss.list || [])
-  }, [platform, onlyWithComments, videoSort])
+  }, [platform, groupFilter, onlyWithComments, videoSort])
 
   // 列表变化后，保持/重选当前视频
   useEffect(() => {
@@ -334,16 +546,17 @@ export default function App() {
       setCurVideo(null)
       return
     }
-    if (!curVideo || !videoList.some((v) => `${v.platform}:${v.objectId}` === curVideo)) {
-      setCurVideo(`${videoList[0].platform}:${videoList[0].objectId}`)
+    if (!curVideo || !videoList.some((v) => `${v.platform}:${v.accountId}:${v.objectId}` === curVideo)) {
+      const v = videoList[0]
+      setCurVideo(`${v.platform}:${v.accountId}:${v.objectId}`)
     }
   }, [videoList, curVideo])
 
   const loadVideoComments = useCallback(async (key: string) => {
-    const [p, ...rest] = key.split(':')
+    const [p, accId, ...rest] = key.split(':')
     const objectId = rest.join(':')
     const d = await fetch(
-      `/api/video/comments?platform=${encodeURIComponent(p)}&objectId=${encodeURIComponent(objectId)}`,
+      `/api/video/comments?platform=${encodeURIComponent(p)}&accountId=${encodeURIComponent(accId)}&objectId=${encodeURIComponent(objectId)}`,
     ).then((r) => r.json())
     setVideoComments(d.list || [])
   }, [])
@@ -358,10 +571,23 @@ export default function App() {
     load()
   }, [curVideo, loadVideoComments, load])
 
-  const loadMsgs = useCallback(async (sid: string) => {
-    const d = await fetch(`/api/dm/sessions/${encodeURIComponent(sid)}/messages`).then((r) => r.json())
+  const loadMsgs = useCallback(async (key: string) => {
+    const [p, accId, ...rest] = key.split(':')
+    const sid = rest.join(':')
+    const d = await fetch(
+      `/api/dm/sessions/${encodeURIComponent(sid)}/messages?platform=${encodeURIComponent(p)}&accountId=${encodeURIComponent(accId)}`,
+    ).then((r) => r.json())
     setMsgs(d.list || [])
   }, [])
+
+  useEffect(() => {
+    if (cur) loadMsgs(cur)
+    else setMsgs([])
+  }, [cur, loadMsgs])
+
+  useEffect(() => {
+    loadAccounts()
+  }, [loadAccounts])
 
   useEffect(() => {
     load()
@@ -369,16 +595,12 @@ export default function App() {
     return () => clearInterval(t)
   }, [load])
 
-  useEffect(() => {
-    if (cur) loadMsgs(cur)
-    else setMsgs([])
-  }, [cur, loadMsgs])
-
   const refresh = async () => {
     setBusy(true)
     try {
       await fetch('/api/collect', { method: 'POST' })
       await load()
+      await loadAccounts()
     } finally {
       setBusy(false)
     }
@@ -386,13 +608,15 @@ export default function App() {
 
   const sendDm = async () => {
     if (!cur || !dmInput.trim() || dmSending) return
+    const [p, accId, ...rest] = cur.split(':')
+    const sid = rest.join(':')
     setDmSending(true)
     setDmErr('')
     try {
-      const r = await fetch(`/api/dm/sessions/${encodeURIComponent(cur)}/send`, {
+      const r = await fetch(`/api/dm/sessions/${encodeURIComponent(sid)}/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: dmInput.trim() }),
+        body: JSON.stringify({ content: dmInput.trim(), accountId: Number(accId) }),
       }).then((x) => x.json())
       if (r.ok) {
         setDmInput('')
@@ -407,8 +631,9 @@ export default function App() {
     }
   }
 
-  const curSession = sessions.find((s) => s.sessionId === cur)
+  const curSession = sessions.find((s) => `${s.platform}:${s.accountId}:${s.sessionId}` === cur)
   const platformName = (k: string) => status?.platforms?.[k]?.name || k
+  const accountLabel = (id: number) => accounts.find((a) => a.id === id)?.label || ''
   const cookieBadge = (k: string) => {
     const p = status?.platforms?.[k]
     if (!p) return null
@@ -447,9 +672,13 @@ export default function App() {
         <button className={tab === 'publish' ? 'tab active' : 'tab'} onClick={() => setTab('publish')}>
           发表
         </button>
+        <button className={tab === 'accounts' ? 'tab active' : 'tab'} onClick={() => setTab('accounts')}>
+          账号
+        </button>
       </nav>
 
-      {tab === 'publish' && <PublishTab />}
+      {tab === 'publish' && <PublishTab groups={groups} accounts={accounts} />}
+      {tab === 'accounts' && <AccountsTab groups={groups} accounts={accounts} onChanged={loadAccounts} />}
 
       {tab === 'comments' && (
         <>
@@ -461,6 +690,22 @@ export default function App() {
                 onClick={() => setPlatform(p)}
               >
                 {p === 'all' ? '全部平台' : platformName(p)}
+              </button>
+            ))}
+            <span className="psep" />
+            <button
+              className={groupFilter === 'all' ? 'pfilter active' : 'pfilter'}
+              onClick={() => setGroupFilter('all')}
+            >
+              全部分组
+            </button>
+            {groups.map((g) => (
+              <button
+                key={g.id}
+                className={groupFilter === g.id ? 'pfilter active' : 'pfilter'}
+                onClick={() => setGroupFilter(g.id)}
+              >
+                {g.name}
               </button>
             ))}
             <label className="ptoggle">
@@ -492,7 +737,7 @@ export default function App() {
             <aside className="vlist">
               {videoList.length === 0 && <div className="empty">暂无视频</div>}
               {videoList.map((v) => {
-                const key = `${v.platform}:${v.objectId}`
+                const key = `${v.platform}:${v.accountId}:${v.objectId}`
                 return (
                   <button
                     key={key}
@@ -511,6 +756,7 @@ export default function App() {
                       </div>
                       <div className="vrow-meta mono">
                         {fmtTime(v.createTime)} · 评论 {v.commentCount}
+                        {accountLabel(v.accountId) ? ` · ${accountLabel(v.accountId)}` : ''}
                       </div>
                     </div>
                   </button>
@@ -522,7 +768,7 @@ export default function App() {
               {curVideo && (
                 <>
                   {(() => {
-                    const v = videoList.find((x) => `${x.platform}:${x.objectId}` === curVideo)
+                    const v = videoList.find((x) => `${x.platform}:${x.accountId}:${x.objectId}` === curVideo)
                     return v ? (
                       <header className="vcard-head">
                         {v.thumbUrl ? (
@@ -537,6 +783,7 @@ export default function App() {
                           </div>
                           <div className="vcard-meta mono">
                             发布 {fmtTime(v.createTime)} · 评论 {v.commentCount}
+                            {accountLabel(v.accountId) ? ` · ${accountLabel(v.accountId)}` : ''}
                           </div>
                         </div>
                       </header>
@@ -561,65 +808,92 @@ export default function App() {
       )}
 
       {tab === 'dm' && (
-        <main className="dm">
-          <aside className="sessions">
-            {sessions.length === 0 && <div className="empty">暂无私信会话</div>}
-            {sessions.map((s) => (
+        <>
+          <div className="pfilters">
+            <button
+              className={groupFilter === 'all' ? 'pfilter active' : 'pfilter'}
+              onClick={() => setGroupFilter('all')}
+            >
+              全部分组
+            </button>
+            {groups.map((g) => (
               <button
-                key={`${s.platform}:${s.sessionId}`}
-                className={s.sessionId === cur ? 'session active' : 'session'}
-                onClick={() => setCur(s.sessionId)}
+                key={g.id}
+                className={groupFilter === g.id ? 'pfilter active' : 'pfilter'}
+                onClick={() => setGroupFilter(g.id)}
               >
-                <Avatar url={s.headImgUrl} name={s.nickname} />
-                <div className="session-main">
-                  <div className="row-head">
-                    <span className="nick">{s.nickname || '未知用户'}</span>
-                    <span className="time mono">{fmtTime(s.lastTs)}</span>
-                  </div>
-                  <div className="preview">
-                    {s.lastContent || '（暂无消息）'} <span className="mono">· {s.msgCount} 条</span>
-                  </div>
-                </div>
+                {g.name}
               </button>
             ))}
-          </aside>
-          <section className="msgs">
-            {!cur && <div className="empty">选择左侧会话查看消息</div>}
-            {cur && (
-              <>
-                <div className="msgs-title">{curSession?.nickname || '会话'}</div>
-                <div className="msgs-flow">
-                  {msgs.map((m) => {
-                    const self = curSession
-                      ? m.fromUsername !== curSession.username
-                      : m.fromUsername.startsWith('v2_')
-                    return (
-                      <div key={m.svrMsgId} className={self ? 'msg self' : 'msg'}>
-                        <div className="bubble">
-                          <div className="content">{m.content}</div>
-                          <div className="time mono">{fmtTime(m.ts)}</div>
-                        </div>
+          </div>
+          <main className="dm">
+            <aside className="sessions">
+              {sessions.length === 0 && <div className="empty">暂无私信会话</div>}
+              {sessions.map((s) => {
+                const key = `${s.platform}:${s.accountId}:${s.sessionId}`
+                return (
+                  <button
+                    key={key}
+                    className={key === cur ? 'session active' : 'session'}
+                    onClick={() => setCur(key)}
+                  >
+                    <Avatar url={s.headImgUrl} name={s.nickname} />
+                    <div className="session-main">
+                      <div className="row-head">
+                        <span className="nick">{s.nickname || '未知用户'}</span>
+                        <span className="time mono">{fmtTime(s.lastTs)}</span>
                       </div>
-                    )
-                  })}
-                </div>
-                <div className="sendbox">
-                  <input
-                    value={dmInput}
-                    onChange={(e) => setDmInput(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && sendDm()}
-                    placeholder="输入私信，Enter 发送"
-                    disabled={dmSending}
-                  />
-                  <button className="btn" onClick={sendDm} disabled={dmSending || !dmInput.trim()}>
-                    {dmSending ? '发送中…' : '发送'}
+                      <div className="preview">
+                        {s.lastContent || '（暂无消息）'} <span className="mono">· {s.msgCount} 条</span>
+                      </div>
+                    </div>
                   </button>
-                </div>
-                {dmErr && <div className="send-err">{dmErr}</div>}
-              </>
-            )}
-          </section>
-        </main>
+                )
+              })}
+            </aside>
+            <section className="msgs">
+              {!cur && <div className="empty">选择左侧会话查看消息</div>}
+              {cur && (
+                <>
+                  <div className="msgs-title">
+                    {curSession?.nickname || '会话'}
+                    {curSession && accountLabel(curSession.accountId) && (
+                      <span className="time mono">（{accountLabel(curSession.accountId)}）</span>
+                    )}
+                  </div>
+                  <div className="msgs-flow">
+                    {msgs.map((m) => {
+                      const self = curSession
+                        ? m.fromUsername !== curSession.username
+                        : m.fromUsername.startsWith('v2_')
+                      return (
+                        <div key={m.svrMsgId} className={self ? 'msg self' : 'msg'}>
+                          <div className="bubble">
+                            <div className="content">{m.content}</div>
+                            <div className="time mono">{fmtTime(m.ts)}</div>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <div className="sendbox">
+                    <input
+                      value={dmInput}
+                      onChange={(e) => setDmInput(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && sendDm()}
+                      placeholder="输入私信，Enter 发送"
+                      disabled={dmSending}
+                    />
+                    <button className="btn" onClick={sendDm} disabled={dmSending || !dmInput.trim()}>
+                      {dmSending ? '发送中…' : '发送'}
+                    </button>
+                  </div>
+                  {dmErr && <div className="send-err">{dmErr}</div>}
+                </>
+              )}
+            </section>
+          </main>
+        </>
       )}
     </div>
   )

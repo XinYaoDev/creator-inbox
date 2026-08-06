@@ -164,6 +164,33 @@ body {
 .vdetail { flex: 1; min-width: 0; overflow-y: auto; max-height: 75vh; }
 .vdetail .vcard-head { border-bottom: 1px solid var(--line); }
 
+/* ---- 账号管理 ---- */
+.acct { padding-top: 20px; display: flex; flex-direction: column; gap: 16px; max-width: 720px; }
+.acct-addgroup { display: flex; gap: 8px; align-items: center; }
+.acct-addgroup input, .acct-add input {
+  border: 1px solid var(--ink); background: var(--paper); padding: 6px 10px;
+  font: inherit; font-size: 13px; border-radius: 0; outline: none;
+}
+.acct-group { border: 1px solid var(--line); padding: 12px; }
+.acct-group-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+.acct-row {
+  display: flex; gap: 12px; align-items: center; padding: 8px 0;
+  border-bottom: 1px dashed var(--line); font-size: 13px;
+}
+.acct-row:last-of-type { border-bottom: none; }
+.acct-label { font-weight: 700; }
+.acct-status { color: var(--gray); }
+.acct-status .ok { color: var(--ink); background: var(--yellow); padding: 0 4px; }
+.acct-status .bad { color: var(--paper); background: var(--ink); padding: 0 4px; }
+.acct-add { display: flex; gap: 8px; margin-top: 8px; }
+.acct-add select, .pub-target select {
+  border: 1px solid var(--ink); background: var(--paper); padding: 5px 8px;
+  font: inherit; font-size: 13px; border-radius: 0; outline: none;
+}
+.pub-target { display: flex; gap: 8px; }
+.pub-results { display: flex; flex-direction: column; gap: 6px; }
+.psep { width: 1px; background: var(--line); align-self: stretch; margin: 0 4px; }
+
 /* ---- 平台筛选与标识 ---- */
 .pfilters { display: flex; gap: 8px; padding-top: 12px; }
 .pfilter {
