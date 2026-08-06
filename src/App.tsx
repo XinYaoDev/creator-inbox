@@ -21,6 +21,9 @@ type Account = {
   platform: string
   platformName: string
   label: string
+  nickname: string
+  headImgUrl: string
+  followers: number | null
   hasCookie: boolean
   cookieValid: boolean | null
 }
@@ -354,6 +357,156 @@ function PublishTab({ groups, accounts }: { groups: Group[]; accounts: Account[]
   )
 }
 
+// ---------- 扫码登录弹层 ----------
+function LoginModal({ acc, onClose, onDone }: { acc: Account; onClose: () => void; onDone: () => void }) {
+  const [sessionId, setSessionId] = useState('')
+  const [status, setStatus] = useState('starting') // starting|waiting|scanned|choose|done|expired|error|manual
+  const [error, setError] = useState('')
+  const [finderList, setFinderList] = useState<{ finderUsername: string; nickname: string; headImgUrl: string }[]>([])
+  const [cookieText, setCookieText] = useState('')
+  const sidRef = useRef('')
+
+  const start = useCallback(async () => {
+    setStatus('starting')
+    setError('')
+    const r = await fetch('/api/login/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: acc.id }),
+    }).then((x) => x.json())
+    if (r.ok) {
+      setSessionId(r.sessionId)
+      sidRef.current = r.sessionId
+      setStatus('waiting')
+    } else {
+      setStatus('error')
+      setError(r.error || '出码失败')
+    }
+  }, [acc.id])
+
+  useEffect(() => { start() }, [start])
+
+  // 轮询登录状态
+  useEffect(() => {
+    if (!sessionId || ['done', 'error', 'expired', 'manual'].includes(status)) return
+    const t = setInterval(async () => {
+      const r = await fetch(`/api/login/status?sessionId=${sessionId}`).then((x) => x.json()).catch(() => null)
+      if (!r || !r.ok) return
+      setStatus(r.status)
+      setError(r.error || '')
+      if (r.finderList) setFinderList(r.finderList)
+      if (r.status === 'done') {
+        onDone()
+        setTimeout(onClose, 1200)
+      }
+    }, 2000)
+    return () => clearInterval(t)
+  }, [sessionId, status, onClose, onDone])
+
+  // 关闭时取消会话
+  useEffect(() => () => {
+    if (sidRef.current) {
+      fetch('/api/login/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: sidRef.current }),
+      })
+    }
+  }, [])
+
+  const choose = async (finderUsername: string) => {
+    const r = await fetch('/api/login/choose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, finderUsername }),
+    }).then((x) => x.json())
+    if (r.ok) {
+      setStatus('done')
+      onDone()
+      setTimeout(onClose, 1200)
+    } else {
+      setStatus('error')
+      setError(r.error || '选号失败')
+    }
+  }
+
+  const saveManual = async () => {
+    const cookie = cookieText.trim()
+    if (!cookie) return
+    const r = await fetch(`/api/accounts/${acc.id}/cookie`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookie }),
+    }).then((x) => x.json())
+    if (r.ok) {
+      onDone()
+      onClose()
+    } else setError(r.error || '保存失败')
+  }
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-title">
+          {acc.hasCookie ? '重新登录' : '登录'} · {acc.label || acc.platformName}
+          <button className="linkbtn modal-x" onClick={onClose}>关闭</button>
+        </div>
+        {status !== 'manual' && (
+          <div className="modal-qr">
+            {sessionId && status !== 'starting' && status !== 'error' ? (
+              <img className="qrimg" src={`/api/login/qr?sessionId=${sessionId}`} alt="登录二维码" />
+            ) : (
+              <div className="qrimg qr-loading">{status === 'starting' ? '出码中…' : '出码失败'}</div>
+            )}
+            <div className="qr-status">
+              {status === 'waiting' && '用微信扫一扫，手机上确认登录'}
+              {status === 'scanned' && '已扫码，请在手机上确认…'}
+              {status === 'confirmed' && '已确认，正在登录…'}
+              {status === 'done' && '✓ 登录成功'}
+              {status === 'expired' && '二维码已过期'}
+              {status === 'error' && (error || '登录失败')}
+            </div>
+            {status === 'choose' && (
+              <div className="qr-choose">
+                <div className="pub-label">这个微信下有多个视频号，选择要登录的：</div>
+                {finderList.map((f) => (
+                  <button key={f.finderUsername} className="btn qr-choice" onClick={() => choose(f.finderUsername)}>
+                    {f.nickname || f.finderUsername}
+                  </button>
+                ))}
+              </div>
+            )}
+            {(status === 'expired' || status === 'error') && (
+              <button className="btn" onClick={start}>重新出码</button>
+            )}
+          </div>
+        )}
+        {status === 'manual' && (
+          <div className="acct-cookie">
+            <textarea
+              rows={4}
+              value={cookieText}
+              onChange={(e) => setCookieText(e.target.value)}
+              placeholder="粘贴 Cookie 请求头整行（DevTools → Network → 任意请求 → Cookie）"
+            />
+            <div className="pub-actions">
+              <button className="btn" onClick={saveManual} disabled={!cookieText.trim()}>保存</button>
+            </div>
+            {error && <div className="send-err">{error}</div>}
+          </div>
+        )}
+        <div className="modal-foot">
+          {status === 'manual' ? (
+            <button className="linkbtn" onClick={() => setStatus('waiting')}>← 返回扫码登录</button>
+          ) : (
+            <button className="linkbtn" onClick={() => setStatus('manual')}>扫码不方便？手动粘贴 Cookie</button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function AccountsTab({
   groups,
   accounts,
@@ -367,6 +520,8 @@ function AccountsTab({
   const [newLabel, setNewLabel] = useState<Record<number, string>>({})
   const [newPlatform, setNewPlatform] = useState<Record<number, string>>({})
   const [msg, setMsg] = useState('')
+  const [confirmDel, setConfirmDel] = useState<string | null>(null)
+  const [loginFor, setLoginFor] = useState<Account | null>(null)
 
   const toast = (s: string) => {
     setMsg(s)
@@ -397,29 +552,8 @@ function AccountsTab({
     if (r.ok) {
       setNewLabel({ ...newLabel, [groupId]: '' })
       onChanged()
-      toast('账号已创建，请更新 Cookie 完成登录')
+      toast('账号已创建，点「登录」扫码完成登录')
     } else toast(r.error || '创建失败')
-  }
-
-  // Tauri/WKWebView 不支持 window.confirm/prompt，全部改用内联 UI
-  const [cookieFor, setCookieFor] = useState<number | null>(null)
-  const [cookieText, setCookieText] = useState('')
-  const [confirmDel, setConfirmDel] = useState<string | null>(null)
-
-  const saveCookie = async (acc: Account) => {
-    const cookie = cookieText.trim()
-    if (!cookie) return
-    const r = await fetch(`/api/accounts/${acc.id}/cookie`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cookie }),
-    }).then((x) => x.json())
-    if (r.ok) {
-      setCookieFor(null)
-      setCookieText('')
-      onChanged()
-      toast('Cookie 已更新，下次采集生效')
-    } else toast(r.error || '更新失败')
   }
 
   const delAccount = async (acc: Account) => {
@@ -470,61 +604,39 @@ function AccountsTab({
               {confirmDel === `grp:${g.id}` ? '确认删除分组？' : '删除分组'}
             </button>
           </header>
-          {(accounts.filter((a) => a.groupId === g.id)).map((a) => (
-            <div key={a.id}>
-              <div className="acct-row">
-                <span className={`ptag ptag-${a.platform}`}>{a.platformName}</span>
-                <span className="acct-label">{a.label || `账号${a.id}`}</span>
-                <span className="acct-status">
-                  Cookie{' '}
-                  {!a.hasCookie ? (
-                    <b className="bad">未配置</b>
-                  ) : a.cookieValid == null ? (
-                    <b>未知</b>
-                  ) : a.cookieValid ? (
-                    <b className="ok">有效</b>
+          <div className="acards">
+            {(accounts.filter((a) => a.groupId === g.id)).map((a) => (
+              <div className="acard" key={a.id}>
+                {a.hasCookie && a.cookieValid === false && <div className="acard-badge">已失效</div>}
+                {a.hasCookie && a.cookieValid === true && <div className="acard-badge ok">在线</div>}
+                {!a.hasCookie && <div className="acard-badge off">未登录</div>}
+                <div className="acard-avatar">
+                  {a.headImgUrl ? (
+                    <img src={proxied(a.headImgUrl)} alt="" loading="lazy" />
                   ) : (
-                    <b className="bad">已失效</b>
+                    <div className="acard-avatar-fallback">{(a.nickname || a.label || '?').slice(0, 1)}</div>
                   )}
-                </span>
-                <button
-                  className="linkbtn"
-                  onClick={() => {
-                    setCookieFor(cookieFor === a.id ? null : a.id)
-                    setCookieText('')
-                  }}
-                >
-                  {cookieFor === a.id ? '收起' : a.hasCookie ? '更新Cookie' : '登录（粘贴Cookie）'}
-                </button>
-                <button
-                  className={confirmDel === `acc:${a.id}` ? 'linkbtn danger' : 'linkbtn'}
-                  onClick={() => delAccount(a)}
-                >
-                  {confirmDel === `acc:${a.id}` ? '确认删除？' : '删除'}
-                </button>
-              </div>
-              {cookieFor === a.id && (
-                <div className="acct-cookie">
-                  <textarea
-                    rows={3}
-                    value={cookieText}
-                    onChange={(e) => setCookieText(e.target.value)}
-                    placeholder={
-                      a.platform === 'wechat'
-                        ? '视频号助手（channels.weixin.qq.com）DevTools → Network → 任意请求 → Cookie 请求头整行粘贴到这里'
-                        : '抖音创作者中心（creator.douyin.com）DevTools → Network → 任意请求 → Cookie 请求头整行粘贴到这里'
-                    }
-                  />
-                  <div className="pub-actions">
-                    <button className="btn" onClick={() => saveCookie(a)} disabled={!cookieText.trim()}>
-                      保存
-                    </button>
-                    <button className="linkbtn" onClick={() => setCookieFor(null)}>取消</button>
-                  </div>
+                  <span className={`acard-ptag ptag-${a.platform}`}>{a.platformName}</span>
                 </div>
-              )}
-            </div>
-          ))}
+                <div className="acard-name">{a.nickname || a.label || `账号${a.id}`}</div>
+                <div className="acard-meta mono">
+                  {a.followers != null ? `粉丝 ${a.followers}` : '粉丝 —'}
+                  {a.label && a.nickname ? ` · ${a.label}` : ''}
+                </div>
+                <div className="acard-actions">
+                  <button className="linkbtn" onClick={() => setLoginFor(a)}>
+                    {a.hasCookie ? '重新登录' : '登录'}
+                  </button>
+                  <button
+                    className={confirmDel === `acc:${a.id}` ? 'linkbtn danger' : 'linkbtn'}
+                    onClick={() => delAccount(a)}
+                  >
+                    {confirmDel === `acc:${a.id}` ? '确认删除？' : '删除'}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
           <div className="acct-add">
             <select
               value={newPlatform[g.id] || 'wechat'}
@@ -543,9 +655,11 @@ function AccountsTab({
         </section>
       ))}
       <div className="pub-label">
-        登录方式：添加账号后点「登录」，粘贴对应平台网页版的 Cookie（DevTools → Network → 任意请求的 Cookie
-        请求头整行）。内置扫码登录面板规划中。
+        视频号点「登录」直接扫码；抖音扫码暂未接入，弹层里可切换手动粘贴 Cookie。
       </div>
+      {loginFor && (
+        <LoginModal acc={loginFor} onClose={() => setLoginFor(null)} onDone={onChanged} />
+      )}
     </main>
   )
 }

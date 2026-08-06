@@ -198,6 +198,47 @@ body {
 .pub-results { display: flex; flex-direction: column; gap: 6px; }
 .psep { width: 1px; background: var(--line); align-self: stretch; margin: 0 4px; }
 
+/* ---- 账号卡片 + 登录弹层 ---- */
+.acards { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.acard {
+  position: relative; border: 1px solid var(--line); padding: 16px 12px 10px;
+  display: flex; flex-direction: column; align-items: center; gap: 4px; text-align: center;
+}
+.acard-badge {
+  position: absolute; top: 0; right: 0; font-size: 11px; padding: 1px 6px;
+  background: var(--ink); color: var(--paper);
+}
+.acard-badge.ok { background: var(--yellow); color: var(--ink); }
+.acard-badge.off { background: var(--line); color: var(--gray); }
+.acard-avatar { position: relative; width: 64px; height: 64px; margin-bottom: 4px; }
+.acard-avatar img { width: 64px; height: 64px; object-fit: cover; border-radius: 0; background: var(--line); }
+.acard-avatar-fallback {
+  width: 64px; height: 64px; display: flex; align-items: center; justify-content: center;
+  background: var(--line); color: var(--gray); font-size: 22px;
+}
+.acard-ptag {
+  position: absolute; right: -6px; bottom: -6px; font-size: 10px; padding: 0 4px;
+  border: 1px solid var(--ink); background: var(--paper); color: var(--ink);
+}
+.acard-ptag.ptag-douyin { background: var(--ink); color: var(--paper); }
+.acard-name { font-weight: 700; font-size: 14px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acard-meta { color: var(--gray); font-size: 12px; }
+.acard-actions { display: flex; gap: 12px; margin-top: 6px; border-top: 1px solid var(--line); padding-top: 8px; width: 100%; justify-content: center; }
+.modal-mask {
+  position: fixed; inset: 0; background: rgba(10, 10, 10, 0.35);
+  display: flex; align-items: center; justify-content: center; z-index: 100;
+}
+.modal { background: var(--paper); border: 2px solid var(--ink); width: 380px; max-width: 92vw; padding: 16px; }
+.modal-title { display: flex; justify-content: space-between; align-items: baseline; font-weight: 700; margin-bottom: 12px; }
+.modal-x { font-weight: 400; }
+.modal-qr { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.qrimg { width: 220px; height: 220px; border: 1px solid var(--line); background: #fff; }
+.qr-loading { display: flex; align-items: center; justify-content: center; color: var(--gray); }
+.qr-status { font-size: 13px; color: var(--gray); }
+.qr-choose { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.qr-choice { width: 100%; }
+.modal-foot { margin-top: 12px; text-align: center; }
+
 /* ---- 平台筛选与标识 ---- */
 .pfilters { display: flex; gap: 8px; padding-top: 12px; }
 .pfilter {

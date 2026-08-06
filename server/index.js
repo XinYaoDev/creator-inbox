@@ -177,6 +177,16 @@ function readLegacyCookie(files) {
 }
 
 // ---------- 账号 ----------
+// 资料列（头像/昵称/粉丝数）增量迁移
+{
+  const cols = db.prepare('PRAGMA table_info(accounts)').all().map((c) => c.name);
+  if (!cols.includes('nickname')) {
+    db.exec("ALTER TABLE accounts ADD COLUMN nickname TEXT DEFAULT ''");
+    db.exec("ALTER TABLE accounts ADD COLUMN headImgUrl TEXT DEFAULT ''");
+    db.exec('ALTER TABLE accounts ADD COLUMN followers INTEGER');
+  }
+}
+
 function listAccounts() {
   return db.prepare('SELECT * FROM accounts ORDER BY id').all();
 }
@@ -186,6 +196,10 @@ function getAccount(id) {
 function setCookieValid(accountId, valid) {
   db.prepare('UPDATE accounts SET cookieValid = ? WHERE id = ?')
     .run(valid == null ? null : valid ? 1 : 0, accountId);
+}
+function saveAccountProfile(accountId, { nickname, headImgUrl, followers }) {
+  db.prepare('UPDATE accounts SET nickname = ?, headImgUrl = ?, followers = ? WHERE id = ?')
+    .run(String(nickname || ''), String(headImgUrl || ''), followers == null ? null : Number(followers), accountId);
 }
 
 const upVideo = db.prepare(`INSERT INTO videos(platform,accountId,objectId,title,thumbUrl,createTime,commentCount)
@@ -372,10 +386,19 @@ async function wxCollectDM(acc, result) {
   }
 }
 
+async function wxFetchProfile(acc) {
+  const r = await wxApi(acc, '/cgi-bin/mmfinderassistant-bin/auth/auth_data', {});
+  const f = r.data?.finderUser;
+  if (r.errCode === 0 && f) {
+    saveAccountProfile(acc.id, { nickname: f.nickname, headImgUrl: f.headImgUrl, followers: f.fansCount });
+  }
+}
+
 async function wxCollect(acc, result) {
   await wxCollectVideos(acc, result);
   await wxCollectComments(acc, result);
   await wxCollectDM(acc, result);
+  try { await wxFetchProfile(acc); } catch { /* 资料抓取失败不影响采集 */ }
 }
 
 // ---------- 抖音（douyin）适配器 ----------
@@ -400,7 +423,7 @@ async function dyApi(acc, p) {
     setCookieValid(acc.id, false);
     throw new Error(`抖音上游返回非 JSON (HTTP ${res.status})，cookie 可能已失效: ${text.slice(0, 120)}`);
   }
-  if (r.status_code !== 0) {
+  if (r.status_code != null && r.status_code !== 0) {
     setCookieValid(acc.id, false);
     throw new Error(`抖音接口 status_code=${r.status_code} status_msg=${r.status_msg || r.status_message || ''}`);
   }
@@ -495,9 +518,18 @@ async function dyCollectComments(acc, result) {
   for (const { objectId } of vids) await dyCollectCommentsForVideo(acc, objectId, result);
 }
 
+async function dyFetchProfile(acc) {
+  const r = await dyApi(acc, '/aweme/v1/creator/user/info/?aid=2906');
+  const u = r.douyin_user_verify_info || {};
+  if (u.nick_name) {
+    saveAccountProfile(acc.id, { nickname: u.nick_name, headImgUrl: u.avatar_url, followers: u.follower_count });
+  }
+}
+
 async function dyCollect(acc, result) {
   await dyCollectVideos(acc, result);
   await dyCollectComments(acc, result);
+  try { await dyFetchProfile(acc); } catch { /* 资料抓取失败不影响采集 */ }
   // 私信：抖音走 imapi.douyin.com IM 体系（需 IM token + 自定义头），逆向成本高，第二批再接入
 }
 
@@ -905,6 +937,121 @@ function enqueueUpload(fn) {
   return job;
 }
 
+// ---------- 视频号扫码登录（qrconnect OAuth 复现，已实测全链路） ----------
+const WX_LOGIN_APPID = 'wx20d84d087938fd46';
+const loginSessions = new Map(); // sessionId → session
+
+function loginCleanup() {
+  const now = Date.now();
+  for (const [id, s] of loginSessions) {
+    if (now - s.createdAt > 15 * 60 * 1000) loginSessions.delete(id);
+  }
+}
+
+function jarHarvest(s, res) {
+  for (const line of (res.headers.getSetCookie ? res.headers.getSetCookie() : [])) {
+    const [pair] = line.split(';');
+    const i = pair.indexOf('=');
+    if (i > 0) s.jar.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
+  }
+}
+const jarHeader = (s) => [...s.jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+
+async function wxLoginCgi(s, p, body) {
+  const res = await fetch(`https://channels.weixin.qq.com/cgi-bin/mmfinderassistant-bin${p}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': UA, Cookie: jarHeader(s) },
+    body: JSON.stringify({ timestamp: String(Date.now()), ...body }),
+    signal: AbortSignal.timeout(20000),
+  });
+  jarHarvest(s, res);
+  return res.json();
+}
+
+async function wxLoginStart(accountId) {
+  loginCleanup();
+  const pageUrl = `https://open.weixin.qq.com/connect/qrconnect?appid=${WX_LOGIN_APPID}&scope=snsapi_login` +
+    `&redirect_uri=${encodeURIComponent('https://channels.weixin.qq.com/platform/oauth-callback.html?dark=0')}` +
+    `&state=undefined&login_type=jssdk&self_redirect=true&styletype=&sizetype=&bgcolor=&rst=&ts=${Date.now()}` +
+    `&style=black&stylelite=1&color_scheme=light`;
+  const res = await fetch(pageUrl, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(20000) });
+  const html = await res.text();
+  const uuid = html.match(/\/connect\/qrcode\/([a-zA-Z0-9_-]+)/)?.[1];
+  if (!uuid) throw new Error('未能从 qrconnect 页面提取 uuid');
+  const s = {
+    id: crypto.randomUUID(), accountId, uuid,
+    status: 'waiting', // waiting|scanned|confirmed|choose|done|expired|cancelled|error
+    jar: new Map(), finderList: null, error: '', qrImg: null, qrType: 'image/png', createdAt: Date.now(),
+  };
+  loginSessions.set(s.id, s);
+  wxLoginPoll(s).catch((e) => {
+    if (!['done', 'cancelled'].includes(s.status)) {
+      s.status = 'error';
+      s.error = String(e && e.message || e);
+    }
+  });
+  return { sessionId: s.id };
+}
+
+async function wxLoginPoll(s) {
+  let last = '';
+  for (let round = 0; round < 90; round++) {
+    if (s.status === 'cancelled') return;
+    let text;
+    try {
+      const url = `https://long.open.weixin.qq.com/connect/l/qrconnect?uuid=${s.uuid}${last ? `&last=${last}` : ''}`;
+      const res = await fetch(url, {
+        headers: { 'User-Agent': UA, Referer: 'https://open.weixin.qq.com/' },
+        signal: AbortSignal.timeout(45000),
+      });
+      text = await res.text();
+    } catch { continue; } // 网络抖动直接续轮
+    const errcode = text.match(/wx_errcode=(\d+)/)?.[1];
+    const code = text.match(/wx_code='([^']*)'/)?.[1];
+    if (errcode === '405' && code) {
+      s.status = 'confirmed';
+      await wxLoginExchange(s, code);
+      return;
+    }
+    if (errcode === '402') { s.status = 'expired'; return; }
+    if (errcode === '403') { s.status = 'cancelled'; return; }
+    if (errcode === '404') { s.status = 'scanned'; if (code) last = code; }
+    // 408/其他 → 继续长轮询
+  }
+  s.status = 'expired';
+}
+
+async function wxLoginExchange(s, code) {
+  const r1 = await wxLoginCgi(s, '/auth/auth_with_oauth', { oauthCode: code });
+  if (r1.errCode !== 0) { s.status = 'error'; s.error = `auth_with_oauth errCode=${r1.errCode}`; return; }
+  const r2 = await wxLoginCgi(s, '/auth/auth_finder_list', {});
+  if (r2.errCode !== 0) { s.status = 'error'; s.error = `auth_finder_list errCode=${r2.errCode}`; return; }
+  const list = (r2.data?.finderList || [])
+    .filter((f) => f.finderUsername)
+    .map((f) => ({ finderUsername: String(f.finderUsername), nickname: String(f.nickname || ''), headImgUrl: String(f.headImgUrl || '') }));
+  if (!list.length) { s.status = 'error'; s.error = '该微信下没有可登录的视频号'; return; }
+  if (list.length === 1) { await wxLoginChoose(s, list[0].finderUsername); return; }
+  s.finderList = list;
+  s.status = 'choose';
+}
+
+async function wxLoginChoose(s, finderUsername) {
+  const r = await wxLoginCgi(s, '/auth/login_finder', { finderUsername });
+  if (r.errCode !== 0) { s.status = 'error'; s.error = `login_finder errCode=${r.errCode}`; return; }
+  const acc = getAccount(s.accountId);
+  if (acc) {
+    db.prepare('UPDATE accounts SET cookie = ?, cookieValid = 1 WHERE id = ?').run(jarHeader(s), acc.id);
+    wxUploadParamsCache.delete(acc.id); // 上传凭证按新 cookie 重取
+    // 顺手抓资料
+    try {
+      const r2 = await wxLoginCgi(s, '/auth/auth_data', {});
+      const f = r2.data?.finderUser;
+      if (f) saveAccountProfile(acc.id, { nickname: f.nickname, headImgUrl: f.headImgUrl, followers: f.fansCount });
+    } catch { /* 非关键 */ }
+  }
+  s.status = 'done';
+}
+
 // ---------- 路由 ----------
 const routes = {
   'GET /api/status': (req, res) => {
@@ -960,6 +1107,9 @@ const routes = {
       platform: a.platform,
       platformName: PLATFORMS[a.platform]?.name || a.platform,
       label: a.label || '',
+      nickname: a.nickname || '',
+      headImgUrl: a.headImgUrl || '',
+      followers: a.followers == null ? null : a.followers,
       hasCookie: Boolean(a.cookie),
       cookieValid: a.cookieValid == null ? null : a.cookieValid === 1,
     }));
@@ -1065,6 +1215,66 @@ const routes = {
   'POST /api/collect': async (req, res) => {
     const r = await collectAll('manual');
     sendJson(res, 200, r);
+  },
+  // ---------- 扫码登录 ----------
+  'POST /api/login/start': async (req, res) => {
+    const body = await readBody(req);
+    const acc = getAccount(Number(body.accountId));
+    if (!acc) return sendJson(res, 404, { ok: false, error: '账号不存在' });
+    if (acc.platform !== 'wechat') {
+      return sendJson(res, 400, { ok: false, error: `${PLATFORMS[acc.platform]?.name || acc.platform} 扫码登录暂未接入，请粘贴 Cookie` });
+    }
+    try {
+      const r = await wxLoginStart(acc.id);
+      sendJson(res, 200, { ok: true, ...r });
+    } catch (e) {
+      sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+    }
+  },
+  'GET /api/login/qr': async (req, res, u) => {
+    const s = loginSessions.get(String(u.searchParams.get('sessionId') || ''));
+    if (!s) return sendJson(res, 404, { error: '登录会话不存在或已过期' });
+    try {
+      if (!s.qrImg) {
+        const r = await fetch(`https://open.weixin.qq.com/connect/qrcode/${s.uuid}`, {
+          headers: { 'User-Agent': UA, Referer: 'https://open.weixin.qq.com/' },
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!r.ok) throw new Error(`二维码拉取 HTTP ${r.status}`);
+        s.qrType = (r.headers.get('content-type') || 'image/png').split(';')[0];
+        s.qrImg = Buffer.from(await r.arrayBuffer());
+      }
+      res.writeHead(200, { 'Content-Type': s.qrType, 'Cache-Control': 'no-store' });
+      res.end(s.qrImg);
+    } catch (e) {
+      sendJson(res, 502, { error: String(e && e.message || e) });
+    }
+  },
+  'GET /api/login/status': (req, res, u) => {
+    const s = loginSessions.get(String(u.searchParams.get('sessionId') || ''));
+    if (!s) return sendJson(res, 404, { ok: false, error: '登录会话不存在或已过期' });
+    sendJson(res, 200, { ok: true, status: s.status, error: s.error, finderList: s.finderList });
+  },
+  'POST /api/login/choose': async (req, res) => {
+    const body = await readBody(req);
+    const s = loginSessions.get(String(body.sessionId || ''));
+    if (!s) return sendJson(res, 404, { ok: false, error: '登录会话不存在或已过期' });
+    if (s.status !== 'choose') return sendJson(res, 400, { ok: false, error: `当前状态 ${s.status} 不能选号` });
+    const fu = String(body.finderUsername || '');
+    if (!s.finderList?.some((f) => f.finderUsername === fu)) {
+      return sendJson(res, 400, { ok: false, error: 'finderUsername 不在候选列表' });
+    }
+    await wxLoginChoose(s, fu);
+    sendJson(res, 200, { ok: s.status === 'done', status: s.status, error: s.error });
+  },
+  'POST /api/login/cancel': async (req, res) => {
+    const body = await readBody(req);
+    const s = loginSessions.get(String(body.sessionId || ''));
+    if (s) {
+      s.status = 'cancelled';
+      loginSessions.delete(s.id);
+    }
+    sendJson(res, 200, { ok: true });
   },
 };
 
