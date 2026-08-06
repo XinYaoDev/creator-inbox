@@ -3,3 +3,4 @@ dist/
 data/
 .sph-cookie
 *.log
+.dy-cookie

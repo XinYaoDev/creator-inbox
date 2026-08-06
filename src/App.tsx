@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useState } from 'react'
 
+type PlatformInfo = { name: string; cookieValid: boolean | null; hasCookie: boolean }
 type Status = {
   lastCollect: number | null
-  cookieValid: boolean | null
   collecting: boolean
+  platforms: Record<string, PlatformInfo>
   lastError: string | null
-  counts: { videos: number; comments: number; sessions: number; messages: number }
+  counts: {
+    videos: number
+    comments: number
+    sessions: number
+    messages: number
+    byPlatform: Record<string, { videos: number; comments: number }>
+  }
 }
 type CommentItem = {
+  platform: string
   commentId: string
   exportId: string
   nickname: string
@@ -19,6 +27,7 @@ type CommentItem = {
   replies?: CommentItem[]
 }
 type VideoCard = {
+  platform: string
   objectId: string
   title: string
   thumbUrl: string
@@ -28,6 +37,7 @@ type VideoCard = {
   comments: CommentItem[]
 }
 type SessionItem = {
+  platform: string
   sessionId: string
   username: string
   nickname: string
@@ -58,7 +68,7 @@ function Avatar({ url, name }: { url?: string | null; name?: string }) {
   return <div className="avatar avatar-fallback">{(name || '?').slice(0, 1)}</div>
 }
 
-function ReplyBox({ commentId, onSent }: { commentId: string; onSent: () => void }) {
+function ReplyBox({ commentId, platform, onSent }: { commentId: string; platform: string; onSent: () => void }) {
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
   const [err, setErr] = useState('')
@@ -70,7 +80,7 @@ function ReplyBox({ commentId, onSent }: { commentId: string; onSent: () => void
       const r = await fetch(`/api/comments/${encodeURIComponent(commentId)}/reply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: text.trim() }),
+        body: JSON.stringify({ content: text.trim(), platform }),
       }).then((x) => x.json())
       if (r.ok) {
         setText('')
@@ -103,6 +113,7 @@ function ReplyBox({ commentId, onSent }: { commentId: string; onSent: () => void
 
 function CommentRow({ c, indent, onSent }: { c: CommentItem; indent?: boolean; onSent: () => void }) {
   const [open, setOpen] = useState(false)
+  const canReply = c.platform === 'wechat' // 抖音回复暂未接入
   return (
     <div className={indent ? 'comment indent' : 'comment'}>
       <Avatar url={c.headUrl} name={c.nickname} />
@@ -114,11 +125,13 @@ function CommentRow({ c, indent, onSent }: { c: CommentItem; indent?: boolean; o
         <div className="content">{c.content}</div>
         <div className="meta">
           <span className="mono">赞 {c.likeCount}</span>
-          <button className="linkbtn" onClick={() => setOpen(!open)}>
-            {open ? '收起' : '回复'}
-          </button>
+          {canReply && (
+            <button className="linkbtn" onClick={() => setOpen(!open)}>
+              {open ? '收起' : '回复'}
+            </button>
+          )}
         </div>
-        {open && <ReplyBox commentId={c.commentId} onSent={onSent} />}
+        {open && canReply && <ReplyBox commentId={c.commentId} platform={c.platform} onSent={onSent} />}
       </div>
     </div>
   )
@@ -126,6 +139,7 @@ function CommentRow({ c, indent, onSent }: { c: CommentItem; indent?: boolean; o
 
 export default function App() {
   const [tab, setTab] = useState<'comments' | 'dm'>('comments')
+  const [platform, setPlatform] = useState<'all' | 'wechat' | 'douyin'>('all')
   const [status, setStatus] = useState<Status | null>(null)
   const [videos, setVideos] = useState<VideoCard[]>([])
   const [sessions, setSessions] = useState<SessionItem[]>([])
@@ -139,11 +153,12 @@ export default function App() {
   const load = useCallback(async () => {
     const st: Status = await fetch('/api/status').then((r) => r.json())
     setStatus(st)
-    const vs = await fetch('/api/videos/with-comments').then((r) => r.json())
+    const q = platform === 'all' ? '' : `?platform=${platform}`
+    const vs = await fetch(`/api/videos/with-comments${q}`).then((r) => r.json())
     setVideos(vs.list || [])
     const ss = await fetch('/api/dm/sessions').then((r) => r.json())
     setSessions(ss.list || [])
-  }, [])
+  }, [platform])
 
   const loadMsgs = useCallback(async (sid: string) => {
     const d = await fetch(`/api/dm/sessions/${encodeURIComponent(sid)}/messages`).then((r) => r.json())
@@ -195,23 +210,26 @@ export default function App() {
   }
 
   const curSession = sessions.find((s) => s.sessionId === cur)
-  const cookieText =
-    status?.cookieValid == null ? '未知' : status.cookieValid ? '有效' : '已失效'
+  const platformName = (k: string) => status?.platforms?.[k]?.name || k
+  const cookieBadge = (k: string) => {
+    const p = status?.platforms?.[k]
+    if (!p) return null
+    if (!p.hasCookie) return <b className="bad">未配置</b>
+    if (p.cookieValid == null) return <b>未知</b>
+    return p.cookieValid ? <b className="ok">有效</b> : <b className="bad">已失效</b>
+  }
 
   return (
     <div className="page">
       <header className="topbar">
-        <div className="brand">
-          聚合收件箱 <span className="brand-dot">·</span> 视频号
-        </div>
+        <div className="brand">聚合收件箱</div>
         <div className="status">
           <span>最后采集 {fmtTime(status?.lastCollect)}</span>
-          <span>
-            Cookie{' '}
-            <b className={status?.cookieValid === false ? 'bad' : 'ok'}>{cookieText}</b>
-          </span>
+          <span>视频号 Cookie {cookieBadge('wechat')}</span>
+          <span>抖音 Cookie {cookieBadge('douyin')}</span>
           <span className="mono">
-            评论 {status?.counts.comments ?? '—'} / 会话 {status?.counts.sessions ?? '—'} / 私信{' '}
+            评论 {status?.counts.comments ?? '—'}（视频号 {status?.counts.byPlatform?.wechat?.comments ?? 0} / 抖音{' '}
+            {status?.counts.byPlatform?.douyin?.comments ?? 0}） / 会话 {status?.counts.sessions ?? '—'} / 私信{' '}
             {status?.counts.messages ?? '—'}
           </span>
           <button className="btn" onClick={refresh} disabled={busy || status?.collecting}>
@@ -231,36 +249,52 @@ export default function App() {
       </nav>
 
       {tab === 'comments' && (
-        <main className="videolist">
-          {videos.length === 0 && <div className="empty">暂无评论</div>}
-          {videos.map((v) => (
-            <section className="vcard" key={v.objectId}>
-              <header className="vcard-head">
-                {v.thumbUrl ? (
-                  <img className="vthumb" src={proxied(v.thumbUrl)} alt="" loading="lazy" />
-                ) : (
-                  <div className="vthumb avatar-fallback">视频</div>
-                )}
-                <div className="vcard-info">
-                  <div className="vcard-title">{v.title || '（无文案视频）'}</div>
-                  <div className="vcard-meta mono">
-                    发布 {fmtTime(v.createTime)} · 评论 {v.commentCount}
+        <>
+          <div className="pfilters">
+            {(['all', 'wechat', 'douyin'] as const).map((p) => (
+              <button
+                key={p}
+                className={platform === p ? 'pfilter active' : 'pfilter'}
+                onClick={() => setPlatform(p)}
+              >
+                {p === 'all' ? '全部平台' : platformName(p)}
+              </button>
+            ))}
+          </div>
+          <main className="videolist">
+            {videos.length === 0 && <div className="empty">暂无评论</div>}
+            {videos.map((v) => (
+              <section className="vcard" key={`${v.platform}:${v.objectId}`}>
+                <header className="vcard-head">
+                  {v.thumbUrl ? (
+                    <img className="vthumb" src={proxied(v.thumbUrl)} alt="" loading="lazy" />
+                  ) : (
+                    <div className="vthumb avatar-fallback">视频</div>
+                  )}
+                  <div className="vcard-info">
+                    <div className="vcard-title">
+                      <span className={`ptag ptag-${v.platform}`}>{platformName(v.platform)}</span>
+                      {v.title || '（无文案视频）'}
+                    </div>
+                    <div className="vcard-meta mono">
+                      发布 {fmtTime(v.createTime)} · 评论 {v.commentCount}
+                    </div>
                   </div>
+                </header>
+                <div className="vcomments">
+                  {v.comments.map((c) => (
+                    <div key={c.commentId}>
+                      <CommentRow c={c} onSent={load} />
+                      {(c.replies || []).map((r) => (
+                        <CommentRow key={r.commentId} c={r} indent onSent={load} />
+                      ))}
+                    </div>
+                  ))}
                 </div>
-              </header>
-              <div className="vcomments">
-                {v.comments.map((c) => (
-                  <div key={c.commentId}>
-                    <CommentRow c={c} onSent={load} />
-                    {(c.replies || []).map((r) => (
-                      <CommentRow key={r.commentId} c={r} indent onSent={load} />
-                    ))}
-                  </div>
-                ))}
-              </div>
-            </section>
-          ))}
-        </main>
+              </section>
+            ))}
+          </main>
+        </>
       )}
 
       {tab === 'dm' && (
@@ -269,7 +303,7 @@ export default function App() {
             {sessions.length === 0 && <div className="empty">暂无私信会话</div>}
             {sessions.map((s) => (
               <button
-                key={s.sessionId}
+                key={`${s.platform}:${s.sessionId}`}
                 className={s.sessionId === cur ? 'session active' : 'session'}
                 onClick={() => setCur(s.sessionId)}
               >

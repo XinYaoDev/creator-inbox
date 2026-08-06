@@ -125,6 +125,20 @@ body {
 
 .send-err { color: var(--ink); background: var(--yellow); padding: 0 6px; font-size: 12px; }
 
+/* ---- 平台筛选与标识 ---- */
+.pfilters { display: flex; gap: 8px; padding-top: 12px; }
+.pfilter {
+  border: 1px solid var(--line); background: none; color: var(--gray);
+  padding: 3px 14px; font-size: 13px; cursor: pointer; border-radius: 0;
+}
+.pfilter:hover { border-color: var(--ink); color: var(--ink); }
+.pfilter.active { border-color: var(--ink); background: var(--ink); color: var(--paper); }
+.ptag {
+  display: inline-block; border: 1px solid var(--ink); font-size: 11px; font-weight: 400;
+  padding: 0 5px; margin-right: 6px; vertical-align: 2px; color: var(--ink);
+}
+.ptag-douyin { background: var(--ink); color: var(--paper); }
+
 /* ---- 私信发送框 ---- */
 .msgs { display: flex; flex-direction: column; }
 .msgs-flow { flex: 1; overflow-y: auto; }
