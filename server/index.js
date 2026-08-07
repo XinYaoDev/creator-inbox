@@ -107,6 +107,14 @@ CREATE TABLE IF NOT EXISTS sent_log(
   content TEXT,
   upstream TEXT
 );
+CREATE TABLE IF NOT EXISTS handled_marks(
+  platform TEXT NOT NULL,
+  accountId INTEGER NOT NULL,
+  kind TEXT NOT NULL,      -- comment=某条顶级评论 session=某个私信会话
+  targetId TEXT NOT NULL,  -- commentId / sessionId
+  createdAt INTEGER,
+  PRIMARY KEY(platform, accountId, kind, targetId)
+);
 `);
 
 // ---------- 迁移 ----------
@@ -695,6 +703,30 @@ function accountCond(col, ids, args) {
   return `${col} IN (${ids.map(() => '?').join(',')})`;
 }
 
+// ---------- 待处理判定 ----------
+// 一条顶级评论「待处理」= 不是我方账号发的 && 楼中楼没有我方回复 && 未手动标记完成
+// 一个私信会话「待处理」= 最后一条消息是对方发的 && 未手动标记完成
+const OWN_NICK_SQL = `(SELECT COALESCE(nickname,'') FROM accounts WHERE id = %s)`;
+function pendingCommentCond(alias) {
+  return `(${alias}.rootCommentId = ''
+    AND (${OWN_NICK_SQL.replace('%s', alias + '.accountId')} = '' OR ${alias}.nickname <> ${OWN_NICK_SQL.replace('%s', alias + '.accountId')})
+    AND NOT EXISTS (
+      SELECT 1 FROM comments r
+      WHERE r.platform = ${alias}.platform AND r.accountId = ${alias}.accountId
+        AND r.rootCommentId = ${alias}.commentId
+        AND ${OWN_NICK_SQL.replace('%s', 'r.accountId')} <> '' AND r.nickname = ${OWN_NICK_SQL.replace('%s', 'r.accountId')})
+    AND NOT EXISTS (
+      SELECT 1 FROM handled_marks h
+      WHERE h.platform = ${alias}.platform AND h.accountId = ${alias}.accountId
+        AND h.kind = 'comment' AND h.targetId = ${alias}.commentId))`;
+}
+
+function handledSet(platform, accountId, kind) {
+  return new Set(
+    db.prepare('SELECT targetId FROM handled_marks WHERE platform=? AND accountId=? AND kind=?')
+      .all(platform, accountId, kind).map((r) => r.targetId));
+}
+
 // ---------- 头像/图片代理（防盗链 + SSRF 白名单 + SQLite 缓存） ----------
 const AVATAR_HOST_SUFFIXES = ['.qlogo.cn', '.finder.video.qq.com', '.douyinpic.com', '.douyincdn.com', '.douyinstatic.com'];
 const AVATAR_HOSTS = new Set(['wx.qlogo.cn', 'finder.video.qq.com', 'douyinpic.com', 'douyincdn.com']);
@@ -791,6 +823,9 @@ async function replyToComment(platform, commentId, content) {
   // 局部重采该视频评论
   const rr = { comments: 0 };
   await wxCollectCommentsForVideo(acc, c.exportId, rr);
+  // 我方回复后该评论自动视为已处理
+  db.prepare('INSERT OR REPLACE INTO handled_marks(platform,accountId,kind,targetId,createdAt) VALUES(?,?,?,?,?)')
+    .run('wechat', c.accountId, 'comment', c.rootCommentId || commentId, Math.floor(Date.now() / 1000));
   return { upstream: r, recollected: rr.comments };
 }
 
@@ -838,6 +873,9 @@ async function sendDM(sessionId, accountId, content) {
   const hm = await wxApi(acc, `${CGI}/private-msg/get-history-msg`, { sessionId, cookie: '' });
   wxCheck(acc, hm, 'dm_history');
   for (const m of hm.data?.msg || []) wxSaveMessage(acc, m);
+  // 我方发信后会话自动视为已处理
+  db.prepare('INSERT OR REPLACE INTO handled_marks(platform,accountId,kind,targetId,createdAt) VALUES(?,?,?,?,?)')
+    .run('wechat', s.accountId, 'session', sessionId, Math.floor(Date.now() / 1000));
   return { upstream: r };
 }
 
@@ -1151,6 +1189,11 @@ const routes = {
         comments: count('comments'),
         sessions: count('dm_sessions'),
         messages: count('dm_messages'),
+        pendingComments: db.prepare(`SELECT COUNT(*) AS n FROM comments c WHERE ${pendingCommentCond('c')}`).get().n,
+        pendingSessions: db.prepare(`
+          SELECT COUNT(*) AS n FROM dm_sessions s
+          WHERE (SELECT fromUsername FROM dm_messages m WHERE m.platform = s.platform AND m.accountId = s.accountId AND m.sessionId = s.sessionId ORDER BY ts DESC LIMIT 1) = s.username
+            AND NOT EXISTS (SELECT 1 FROM handled_marks h WHERE h.platform = s.platform AND h.accountId = s.accountId AND h.kind = 'session' AND h.targetId = s.sessionId)`).get().n,
         byPlatform: {
           wechat: {
             videos: db.prepare("SELECT COUNT(*) AS n FROM videos WHERE platform='wechat'").get().n,
@@ -1218,17 +1261,18 @@ const routes = {
     sendJson(res, 200, { list });
   },
   'GET /api/avatar': handleAvatar,
-  // 视频列表（master-detail 左栏）：可筛平台/分组/只看有评论，两种排序
+  // 视频列表（master-detail 左栏）：可筛平台/分组/状态，两种排序
   'GET /api/videos': (req, res, u) => {
     const platform = u.searchParams.get('platform') || '';
-    const hasComments = u.searchParams.get('hasComments') === '1';
     const ids = accountIdsForGroup(u.searchParams.get('groupId'));
+    const statusFilter = u.searchParams.get('status') || 'pending'; // pending|done|all
     const args = [];
     const conds = [accountCond('v.accountId', ids, args)];
     if (platform) { conds.push('v.platform = ?'); args.push(platform); }
-    if (hasComments) {
-      conds.push('(SELECT COUNT(*) FROM comments c WHERE c.platform = v.platform AND c.accountId = v.accountId AND c.exportId = v.objectId) > 0');
-    }
+    const pendingSql = `(SELECT COUNT(*) FROM comments c WHERE c.platform = v.platform AND c.accountId = v.accountId AND c.exportId = v.objectId AND ${pendingCommentCond('c')})`;
+    const totalSql = `(SELECT COUNT(*) FROM comments c0 WHERE c0.platform = v.platform AND c0.accountId = v.accountId AND c0.exportId = v.objectId)`;
+    if (statusFilter === 'pending') conds.push(`${pendingSql} > 0`);
+    else if (statusFilter === 'done') conds.push(`${pendingSql} = 0 AND ${totalSql} > 0`);
     const sort = u.searchParams.get('sort') === 'time' ? 'time' : 'comment';
     const orderBy = sort === 'time'
       ? 'v.createTime DESC'
@@ -1236,19 +1280,22 @@ const routes = {
     const list = db.prepare(`
       SELECT v.platform, v.accountId, v.objectId, v.title, v.thumbUrl, v.createTime, v.commentCount,
         (SELECT MAX(c.createTime) FROM comments c WHERE c.platform = v.platform AND c.accountId = v.accountId AND c.exportId = v.objectId) AS latestCommentTs,
-        (SELECT COUNT(*) FROM comments c WHERE c.platform = v.platform AND c.accountId = v.accountId AND c.exportId = v.objectId) AS collectedComments
+        ${totalSql} AS collectedComments,
+        ${pendingSql} AS pendingCount
       FROM videos v WHERE ${conds.join(' AND ')}
       ORDER BY ${orderBy}
       LIMIT 500`).all(...args);
     sendJson(res, 200, { list });
   },
-  // 单个视频的评论树（master-detail 右栏）
+  // 单个视频的评论树（master-detail 右栏），带待处理标记
   'GET /api/video/comments': (req, res, u) => {
     const platform = u.searchParams.get('platform') || 'wechat';
     const accountId = Number(u.searchParams.get('accountId')) || 0;
     const objectId = u.searchParams.get('objectId') || '';
     const all = db.prepare('SELECT * FROM comments WHERE platform = ? AND accountId = ? AND exportId = ? ORDER BY createTime ASC')
       .all(platform, accountId, objectId);
+    const ownNick = db.prepare('SELECT nickname FROM accounts WHERE id = ?').get(accountId)?.nickname || '';
+    const marks = handledSet(platform, accountId, 'comment');
     const tops = all.filter((c) => !c.rootCommentId);
     const topIds = new Set(tops.map((c) => c.commentId));
     const byRoot = {};
@@ -1258,25 +1305,77 @@ const routes = {
       if (topIds.has(c.rootCommentId)) (byRoot[c.rootCommentId] = byRoot[c.rootCommentId] || []).push(c);
       else orphans.push(c); // root 评论已不可见，楼中楼降级为顶级展示
     }
+    const withFlags = (c) => {
+      const replies = byRoot[c.commentId] || [];
+      const pending = Boolean(
+        (!ownNick || c.nickname !== ownNick) &&
+        !(ownNick && replies.some((r) => r.nickname === ownNick)) &&
+        !marks.has(c.commentId));
+      return { ...c, pending, replies };
+    };
     sendJson(res, 200, {
       list: [
-        ...tops.map((c) => ({ ...c, replies: byRoot[c.commentId] || [] })),
-        ...orphans.map((c) => ({ ...c, replies: [] })),
+        ...tops.map(withFlags),
+        ...orphans.map((c) => ({ ...c, pending: false, replies: [] })),
       ],
     });
   },
+  // 标记完成/取消
+  'POST /api/handled': async (req, res) => {
+    const body = await readBody(req);
+    const platform = String(body.platform || '');
+    const accountId = Number(body.accountId) || 0;
+    const kind = body.kind === 'session' ? 'session' : 'comment';
+    const targetId = String(body.targetId || '');
+    if (!platform || !accountId || !targetId) return sendJson(res, 400, { ok: false, error: '参数不全' });
+    if (body.done) {
+      db.prepare('INSERT OR REPLACE INTO handled_marks(platform,accountId,kind,targetId,createdAt) VALUES(?,?,?,?,?)')
+        .run(platform, accountId, kind, targetId, Math.floor(Date.now() / 1000));
+    } else {
+      db.prepare('DELETE FROM handled_marks WHERE platform=? AND accountId=? AND kind=? AND targetId=?')
+        .run(platform, accountId, kind, targetId);
+    }
+    sendJson(res, 200, { ok: true });
+  },
+  // 搜索：评论内容/昵称 + 私信会话昵称
+  'GET /api/search': (req, res, u) => {
+    const q = String(u.searchParams.get('q') || '').trim();
+    if (!q) return sendJson(res, 200, { comments: [], sessions: [] });
+    const like = `%${q}%`;
+    const comments = db.prepare(`
+      SELECT c.platform, c.accountId, c.commentId, c.exportId, c.nickname, c.content, c.createTime,
+             v.title AS videoTitle
+      FROM comments c LEFT JOIN videos v ON v.platform = c.platform AND v.accountId = c.accountId AND v.objectId = c.exportId
+      WHERE c.content LIKE ? OR c.nickname LIKE ?
+      ORDER BY c.createTime DESC LIMIT 30`).all(like, like);
+    const sessions = db.prepare(`
+      SELECT platform, accountId, sessionId, nickname, headImgUrl FROM dm_sessions
+      WHERE nickname LIKE ? LIMIT 20`).all(like);
+    sendJson(res, 200, { comments, sessions });
+  },
   'GET /api/dm/sessions': (req, res, u) => {
     const ids = accountIdsForGroup(u.searchParams.get('groupId'));
+    const statusFilter = u.searchParams.get('status') || 'all'; // pending|done|all
     const args = [];
     const cond = accountCond('s.accountId', ids, args);
     const list = db.prepare(`
       SELECT s.platform, s.accountId, s.sessionId, s.username, s.nickname, s.headImgUrl, s.sessionType,
         (SELECT content FROM dm_messages m WHERE m.platform = s.platform AND m.accountId = s.accountId AND m.sessionId = s.sessionId ORDER BY ts DESC LIMIT 1) AS lastContent,
         (SELECT ts FROM dm_messages m WHERE m.platform = s.platform AND m.accountId = s.accountId AND m.sessionId = s.sessionId ORDER BY ts DESC LIMIT 1) AS lastTs,
+        (SELECT fromUsername FROM dm_messages m WHERE m.platform = s.platform AND m.accountId = s.accountId AND m.sessionId = s.sessionId ORDER BY ts DESC LIMIT 1) AS lastFrom,
         (SELECT COUNT(*) FROM dm_messages m WHERE m.platform = s.platform AND m.accountId = s.accountId AND m.sessionId = s.sessionId) AS msgCount
       FROM dm_sessions s WHERE ${cond} ORDER BY lastTs DESC`).all(...args);
-    for (const s of list) s.unread = 0; // demo 不做真未读
-    sendJson(res, 200, { list });
+    for (const s of list) {
+      s.unread = 0; // demo 不做真未读
+      // 待处理 = 最后一条是对方发的 && 未手动标记
+      const marked = db.prepare("SELECT 1 FROM handled_marks WHERE platform=? AND accountId=? AND kind='session' AND targetId=?")
+        .get(s.platform, s.accountId, s.sessionId);
+      s.pending = Boolean(s.lastFrom && s.lastFrom === s.username && !marked);
+    }
+    const filtered = statusFilter === 'pending' ? list.filter((s) => s.pending)
+      : statusFilter === 'done' ? list.filter((s) => !s.pending)
+      : list;
+    sendJson(res, 200, { list: filtered });
   },
   // 异步触发：立即返回，前端轮询 /api/status 的 collecting 标志
   'POST /api/collect': (req, res) => {
