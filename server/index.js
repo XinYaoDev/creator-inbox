@@ -193,6 +193,9 @@ function readLegacyCookie(files) {
     db.exec("ALTER TABLE accounts ADD COLUMN headImgUrl TEXT DEFAULT ''");
     db.exec('ALTER TABLE accounts ADD COLUMN followers INTEGER');
   }
+  if (!cols.includes('lastError')) {
+    db.exec("ALTER TABLE accounts ADD COLUMN lastError TEXT DEFAULT ''");
+  }
 }
 
 function listAccounts() {
@@ -637,10 +640,12 @@ async function collectAll(trigger = 'auto') {
       try {
         await collect(acc, r, full);
         setCookieValid(acc.id, true);
+        db.prepare("UPDATE accounts SET lastError = '' WHERE id = ?").run(acc.id);
         r.ok = true;
       } catch (e) {
         r.ok = false;
         r.error = String(e && e.message || e);
+        db.prepare('UPDATE accounts SET lastError = ? WHERE id = ?').run(r.error, acc.id);
         result.errors.push(`[${PLATFORMS[acc.platform]?.name || acc.platform}·${acc.label || acc.id}] ${r.error}`);
       }
       result.accounts[key] = r;
@@ -1221,6 +1226,12 @@ const routes = {
       followers: a.followers == null ? null : a.followers,
       hasCookie: Boolean(a.cookie),
       cookieValid: a.cookieValid == null ? null : a.cookieValid === 1,
+      lastError: a.lastError || '',
+      // 三态+未登录：online=在线 error=异常(采集报错) expired=需重新登录 none=未登录
+      state: !a.cookie ? 'none'
+        : a.cookieValid === 0 ? 'expired'
+        : a.lastError ? 'error'
+        : a.cookieValid === 1 ? 'online' : 'none',
     }));
     sendJson(res, 200, { groups, accounts });
   },
@@ -1561,12 +1572,38 @@ const server = http.createServer(async (req, res) => {
         db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
         return sendJson(res, 200, { ok: true });
       }
+      // 账号编辑（备注/移动分组）
+      if (req.method === 'POST' && mAcc) {
+        const acc = getAccount(Number(mAcc[1]));
+        if (!acc) return sendJson(res, 404, { ok: false, error: '账号不存在' });
+        const body = await readBody(req);
+        if (body.label !== undefined) {
+          db.prepare('UPDATE accounts SET label = ? WHERE id = ?').run(String(body.label).trim(), acc.id);
+        }
+        if (body.groupId !== undefined) {
+          const gid = Number(body.groupId);
+          if (!db.prepare('SELECT id FROM account_groups WHERE id=?').get(gid)) {
+            return sendJson(res, 400, { ok: false, error: '分组不存在' });
+          }
+          db.prepare('UPDATE accounts SET groupId = ? WHERE id = ?').run(gid, acc.id);
+        }
+        return sendJson(res, 200, { ok: true });
+      }
       const mGrp = pathname.match(/^\/api\/groups\/(\d+)$/);
       if (req.method === 'DELETE' && mGrp) {
         const id = Number(mGrp[1]);
         const n = db.prepare('SELECT COUNT(*) AS n FROM accounts WHERE groupId = ?').get(id).n;
         if (n) return sendJson(res, 400, { ok: false, error: '分组下还有账号，先删账号' });
         db.prepare('DELETE FROM account_groups WHERE id = ?').run(id);
+        return sendJson(res, 200, { ok: true });
+      }
+      // 分组重命名
+      if (req.method === 'POST' && mGrp) {
+        const id = Number(mGrp[1]);
+        const body = await readBody(req);
+        const name = String(body.name || '').trim();
+        if (!name) return sendJson(res, 400, { ok: false, error: '分组名为空' });
+        db.prepare('UPDATE account_groups SET name = ? WHERE id = ?').run(name, id);
         return sendJson(res, 200, { ok: true });
       }
       const m = pathname.match(/^\/api\/dm\/sessions\/([^/]+)\/messages$/);

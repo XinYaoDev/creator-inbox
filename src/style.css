@@ -240,6 +240,39 @@ body {
 .pub-results { display: flex; flex-direction: column; gap: 6px; }
 .psep { width: 1px; background: var(--line); align-self: stretch; margin: 0 4px; }
 
+/* ---- 账号管理双栏 ---- */
+.acct2 { display: flex; gap: 20px; padding-top: 16px; align-items: flex-start; }
+.gnav { width: 180px; flex: none; border: 1px solid var(--line); padding: 10px; display: flex; flex-direction: column; gap: 2px; }
+.gnav-title { color: var(--gray); font-size: 12px; padding: 2px 8px 8px; }
+.gnav-item {
+  border: none; background: none; text-align: left; padding: 7px 8px; font: inherit; font-size: 13px;
+  cursor: pointer; border-radius: 0; color: inherit; display: flex; justify-content: space-between;
+}
+.gnav-item:hover { background: #F2F2ED; }
+.gnav-item.active { background: var(--yellow); }
+.gnav-new { color: var(--gray); }
+.gnav-add { display: flex; gap: 6px; padding: 4px; align-items: center; }
+.gnav-add input {
+  border: 1px solid var(--ink); background: var(--paper); padding: 4px 8px;
+  font: inherit; font-size: 13px; border-radius: 0; outline: none; width: 110px;
+}
+.acct-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.acct-summary { color: var(--gray); font-size: 12px; display: flex; gap: 12px; align-items: center; }
+.acct-err { display: flex; align-items: center; gap: 8px; margin-top: 0; }
+.acct-err-actions { margin-left: auto; display: flex; gap: 12px; }
+.acct-group-head { display: flex; justify-content: space-between; align-items: baseline; }
+.acct-group-ops { display: flex; gap: 12px; }
+.acard-badge.st-online { background: var(--yellow); color: var(--ink); }
+.acard-badge.st-error { background: var(--yellow); color: var(--ink); }
+.acard-badge.st-expired { background: var(--ink); color: var(--paper); }
+.acard-badge.st-none { background: var(--line); color: var(--gray); }
+.acard-add {
+  border: 1px dashed var(--gray); cursor: pointer; justify-content: center; min-height: 180px;
+}
+.acard-add:hover { border-color: var(--ink); }
+.acard-add-plus { color: var(--gray); font-size: 13px; }
+.acard-add:hover .acard-add-plus { color: var(--ink); }
+
 /* ---- 账号卡片 + 登录弹层 ---- */
 .acards { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
 .acard {
