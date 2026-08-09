@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import LibraryTab from './LibraryTab'
 
 type PlatformInfo = { name: string; cookieValid: boolean | null; hasCookie: boolean; accountCount: number }
 type Status = {
@@ -825,7 +826,7 @@ function AccountsTab({
 }
 
 export default function App() {
-  const [view, setView] = useState<'inbox' | 'publish' | 'settings'>('inbox')
+  const [view, setView] = useState<'inbox' | 'publish' | 'settings' | 'library'>('inbox')
   const [inboxTab, setInboxTab] = useState<'comments' | 'dm'>('comments')
   const [platform, setPlatform] = useState<'all' | 'wechat' | 'douyin'>('all')
   const [groupFilter, setGroupFilter] = useState<'all' | number>('all')
@@ -1074,6 +1075,7 @@ export default function App() {
           <button className="iconbtn" title="刷新" onClick={refresh} disabled={busy || status?.collecting}>
             {busy || status?.collecting ? '…' : '↻'}
           </button>
+          <button className="iconbtn" title="素材库" onClick={() => setView('library')}>素材库</button>
           <button className="iconbtn publish-btn" onClick={() => setView('publish')}>+ 发布</button>
           <button className="iconbtn" title="设置" onClick={() => setView('settings')}>⚙</button>
           {toast && <span className="pub-ok">{toast}</span>}
@@ -1116,6 +1118,12 @@ export default function App() {
             lastCollect={status?.lastCollect ?? null}
             onRecollect={refresh}
           />
+        </>
+      )}
+
+      {view === 'library' && (
+        <>
+          <LibraryTab onBack={() => setView('inbox')} />
         </>
       )}
 

@@ -4,6 +4,8 @@
 // 每个平台一个采集适配器（wechat=视频号，douyin=抖音），新平台只需再加一个适配器。
 'use strict';
 
+const createLibrary = require('./library.js');
+
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -1456,6 +1458,16 @@ const routes = {
   },
 };
 
+// ---------- 素材库 ----------
+const libraryHandle = createLibrary({
+  db,
+  sendJson,
+  readBody,
+  mediaRoot: process.env.MEDIA_ROOT || '',
+  thumbDir: process.env.THUMB_DIR || path.join(DATA_DIR, 'thumbs'),
+  uploadDir: UPLOAD_DIR,
+});
+
 function serveStatic(req, res, pathname) {
   let p = decodeURIComponent(pathname);
   if (p === '/') p = '/index.html';
@@ -1481,6 +1493,7 @@ const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = u.pathname;
     if (pathname.startsWith('/api/')) {
+      if (pathname.startsWith('/api/library/')) return await libraryHandle(req, res, u);
       const key = `${req.method} ${pathname}`;
       if (routes[key]) return await routes[key](req, res, u);
       // 上传文件（原始字节流，非 multipart）：?kind=video|cover&filename=xx.mp4
