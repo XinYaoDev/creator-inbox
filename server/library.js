@@ -12,7 +12,7 @@ const crypto = require('node:crypto');
 const LIB_SCAN_DIRS = ['00_Inbox', '01_Master', '02_Proxies', '90_Review'];
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm']);
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
-const FACETS = ['内容主体', '场景', '行为', '镜头', '氛围', '内容用途'];
+const FACETS = ['内容主体', '场景', '行为', '镜头', '氛围', '内容用途', '精选主题'];
 const PRESET_TAGS = {
   '内容主体': ['白蟹', '小青龙', '海鲜', '房间', '鱼塘', '客人', '外景'],
   '场景': ['餐厅', '厨房', '院子', '海边', '房间', '菜场'],
