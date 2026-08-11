@@ -1028,7 +1028,7 @@ export default function App() {
   return (
     <div className="page">
       <header className="topbar">
-        <div className="brand">聚合收件箱</div>
+        <div className="brand">Creator Inbox</div>
         <div className="topbar-summary mono">
           {status
             ? `${status.counts.comments} 条评论 · ${status.counts.messages} 条私信 · ${pendingTotal} 待处理`

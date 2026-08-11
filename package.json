@@ -1,8 +1,9 @@
 {
-  "name": "wechat-inbox",
-  "private": true,
-  "version": "0.1.0",
+  "name": "creator-inbox",
+  "private": false,
+  "version": "0.2.0",
   "type": "module",
+  "description": "Self-hosted creator inbox: aggregate comments & DMs from WeChat Channels and Douyin, manage media library, streamline publishing.",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build"

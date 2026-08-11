@@ -146,7 +146,7 @@ function readLegacyCookie(files) {
       path.join(DATA_DIR, 'dy-cookie.override'),
       process.env.DY_COOKIE_FILE || '/run/secrets/dy-cookie',
     ]);
-    insAcc.run(gid, 'wechat', '岳井民宿', wxCookie, now);
+    insAcc.run(gid, 'wechat', '示例账号', wxCookie, now);
     insAcc.run(gid, 'douyin', '抖音主号', dyCookie, now);
     console.log(`[migrate] 初始化分组/账号，视频号 cookie ${wxCookie ? '已入库' : '缺失'}，抖音 cookie ${dyCookie ? '已入库' : '缺失'}`);
   }
