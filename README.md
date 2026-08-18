@@ -131,7 +131,7 @@ Full API documented in [`docs/API.md`](docs/API.md) *(in progress)*.
 - [x] Pending-first triage
 - [x] Media library with facet tags (v1)
 - [x] Docker + NAS deployment
-- [x] Tauri desktop shell (v0.1)
+- [x] Tauri desktop shell (v0.2, configurable server URL)
 - [ ] Publish API integration (scheduled uploads)
 - [ ] More platform adapters (Bilibili, Xiaohongshu, YouTube)
 - [ ] Comment sentiment / fan-relationship analytics
