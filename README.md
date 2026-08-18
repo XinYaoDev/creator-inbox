@@ -51,7 +51,6 @@ Creators today juggle: comments scattered across platforms, DMs buried in apps, 
 ### Option A — Docker (recommended for NAS/home server)
 
 ```bash
-npm install && npm run build   # dist/ is gitignored; the image COPYs it
 docker build -t creator-inbox .
 docker run -d -p 8877:8877 \
   -v /path/to/data:/app/data \
@@ -76,7 +75,7 @@ Open `http://<host>:8877` — done.
 ### Option B — Local dev
 
 ```bash
-# Backend (Node 22.5+；早期 22.x 需 --experimental-sqlite 才能用 node:sqlite，近期 22.x / 23.4+ / 24 免 flag)
+# Backend (Node 22.5+ / 24; see .nvmrc. Early 22.x needs --experimental-sqlite)
 node server/index.js            # listens on :8877
 
 # Frontend (Vite + React + TS)
@@ -145,6 +144,10 @@ Full API documented in [`docs/API.md`](docs/API.md) *(in progress)*.
 - **Desktop**: Tauri 2 (Rust shell, optional)
 - **Data**: SQLite, single file
 - **Deploy**: Docker (with ffmpeg for media thumbnails)
+
+## 🔒 Security
+
+Cookies live in SQLite. Set `AUTH_TOKEN` on any shared network. See [SECURITY.md](SECURITY.md).
 
 ## 📄 License
 

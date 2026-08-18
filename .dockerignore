@@ -1,0 +1,13 @@
+.git
+.github
+node_modules
+dist
+data
+*.log
+.sph-cookie
+.dy-cookie
+.DS_Store
+*.md
+docs
+LICENSE
+.nvmrc

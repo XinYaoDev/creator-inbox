@@ -4,6 +4,9 @@
   "version": "0.2.0",
   "type": "module",
   "description": "Self-hosted creator inbox: aggregate comments & DMs from WeChat Channels and Douyin, manage media library, streamline publishing.",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
