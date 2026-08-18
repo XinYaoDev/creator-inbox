@@ -16,6 +16,15 @@ const PORT = Number(process.env.PORT || 8877);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'inbox.db');
 const STATIC_DIR = process.env.STATIC_DIR || path.join(__dirname, '..', 'dist');
 const DATA_DIR = path.dirname(DB_PATH);
+// 可选访问令牌：设置后所有 /api/* 请求需带 Authorization: Bearer <token>（或 ?token=，供 <img>/<video> 直链）
+const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '');
+
+function apiAuthed(req, u) {
+  if (!AUTH_TOKEN) return true;
+  if ((req.headers.authorization || '') === `Bearer ${AUTH_TOKEN}`) return true;
+  if (u.searchParams.get('token') === AUTH_TOKEN) return true;
+  return false;
+}
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0';
 
@@ -28,6 +37,7 @@ const PLATFORMS = {
 // ---------- 数据库 ----------
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(DB_PATH);
+try { fs.chmodSync(DB_PATH, 0o600); } catch { /* 不支持 chmod 的平台忽略 */ } // 库里有明文 cookie，限本人可读
 db.exec(`
 CREATE TABLE IF NOT EXISTS account_groups(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,7 +197,7 @@ function readLegacyCookie(files) {
 }
 
 // ---------- 账号 ----------
-// 资料列（头像/昵称/粉丝数）增量迁移
+// 资料列（头像/昵称/粉丝数/平台用户名）增量迁移
 {
   const cols = db.prepare('PRAGMA table_info(accounts)').all().map((c) => c.name);
   if (!cols.includes('nickname')) {
@@ -198,7 +208,28 @@ function readLegacyCookie(files) {
   if (!cols.includes('lastError')) {
     db.exec("ALTER TABLE accounts ADD COLUMN lastError TEXT DEFAULT ''");
   }
+  if (!cols.includes('username')) {
+    db.exec("ALTER TABLE accounts ADD COLUMN username TEXT DEFAULT ''"); // 视频号 finderUsername，用于私信 self 判定
+  }
 }
+// comments.isAuthor：采集时快照「是否我方所发」。原来靠 nickname 实时比对，
+// 自己改名后历史数据全部误判；快照后改名不影响存量。
+{
+  const cols = db.prepare('PRAGMA table_info(comments)').all().map((c) => c.name);
+  if (!cols.includes('isAuthor')) {
+    db.exec('ALTER TABLE comments ADD COLUMN isAuthor INTEGER');
+    // 老数据按当前账号昵称回填一次（仅迁移用，此后以采集快照为准）
+    db.exec(`UPDATE comments SET isAuthor = CASE
+      WHEN COALESCE(nickname,'') <> ''
+        AND nickname = (SELECT COALESCE(nickname,'') FROM accounts WHERE id = comments.accountId)
+      THEN 1 ELSE 0 END`);
+  }
+}
+// 评论按视频聚合 / 楼中楼 EXISTS 子查询的索引（/api/videos 每行都跑相关子查询）
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(platform, accountId, exportId);
+CREATE INDEX IF NOT EXISTS idx_comments_root ON comments(platform, accountId, rootCommentId);
+`);
 
 function listAccounts() {
   return db.prepare('SELECT * FROM accounts ORDER BY id').all();
@@ -210,20 +241,21 @@ function setCookieValid(accountId, valid) {
   db.prepare('UPDATE accounts SET cookieValid = ? WHERE id = ?')
     .run(valid == null ? null : valid ? 1 : 0, accountId);
 }
-function saveAccountProfile(accountId, { nickname, headImgUrl, followers }) {
-  db.prepare('UPDATE accounts SET nickname = ?, headImgUrl = ?, followers = ? WHERE id = ?')
-    .run(String(nickname || ''), String(headImgUrl || ''), followers == null ? null : Number(followers), accountId);
+function saveAccountProfile(accountId, { nickname, headImgUrl, followers, username }) {
+  db.prepare('UPDATE accounts SET nickname = ?, headImgUrl = ?, followers = ?, username = COALESCE(?, username) WHERE id = ?')
+    .run(String(nickname || ''), String(headImgUrl || ''), followers == null ? null : Number(followers),
+      username == null ? null : String(username), accountId);
 }
 
 const upVideo = db.prepare(`INSERT INTO videos(platform,accountId,objectId,title,thumbUrl,createTime,commentCount)
   VALUES(?,?,?,?,?,?,?)
   ON CONFLICT(platform,accountId,objectId) DO UPDATE SET title=excluded.title, thumbUrl=excluded.thumbUrl,
     createTime=excluded.createTime, commentCount=excluded.commentCount`);
-const upComment = db.prepare(`INSERT INTO comments(platform,accountId,commentId,exportId,nickname,content,headUrl,createTime,likeCount,rootCommentId)
-  VALUES(?,?,?,?,?,?,?,?,?,?)
+const upComment = db.prepare(`INSERT INTO comments(platform,accountId,commentId,exportId,nickname,content,headUrl,createTime,likeCount,rootCommentId,isAuthor)
+  VALUES(?,?,?,?,?,?,?,?,?,?,?)
   ON CONFLICT(platform,accountId,commentId) DO UPDATE SET nickname=excluded.nickname, content=excluded.content,
     headUrl=excluded.headUrl, createTime=excluded.createTime, likeCount=excluded.likeCount,
-    rootCommentId=excluded.rootCommentId`);
+    rootCommentId=excluded.rootCommentId, isAuthor=excluded.isAuthor`);
 const upSession = db.prepare(`INSERT INTO dm_sessions(platform,accountId,sessionId,username,nickname,headImgUrl,sessionType)
   VALUES(?,?,?,?,?,?,?)
   ON CONFLICT(platform,accountId,sessionId) DO UPDATE SET username=excluded.username, nickname=excluded.nickname,
@@ -259,9 +291,15 @@ async function wxApi(acc, p, extra) {
   }
 }
 
+// 只有鉴权类错误才标记 cookie 失效；限流（「请求过于频繁」errCode=-1）等临时错误
+// 只记 lastError，否则会误报「登录已失效」引导用户反复重新扫码
+function isAuthError(msg) {
+  return /重新登录|登录已失效|未登录|登录态|登陆失效|凭证|授权失效|unauthorized|forbidden/i.test(String(msg || ''));
+}
+
 function wxCheck(acc, r, stage) {
   if (r.errCode !== 0) {
-    setCookieValid(acc.id, false);
+    if (isAuthError(r.errMsg)) setCookieValid(acc.id, false);
     throw new Error(`${stage} errCode=${r.errCode} errMsg=${r.errMsg || ''}`);
   }
 }
@@ -278,19 +316,28 @@ function wxSaveVideo(acc, v) {
   );
 }
 
+// 是否我方所发：采集当时与账号昵称比对并快照落库（昵称可撞名，属尽力判断；
+// 通过本工具发出的回复另有 handled_marks 自动标记兜底）
+function authorFlag(acc, nick) {
+  const own = String(acc.nickname || '').trim();
+  return own && String(nick || '').trim() === own ? 1 : 0;
+}
+
 function wxSaveComment(acc, exportId, c, rootCommentId = '') {
   const id = String(c.commentId || '');
   if (!id) return;
+  const nick = String(c.commentNickname || '');
   upComment.run(
     'wechat', acc.id,
     id,
     String(exportId),
-    String(c.commentNickname || ''),
+    nick,
     String(c.commentContent || ''),
     String(c.commentHeadurl || ''),
     Number(c.commentCreatetime) || 0,
     Number(c.commentLikeCount) || 0,
     String(rootCommentId || ''),
+    authorFlag(acc, nick),
   );
 }
 
@@ -384,7 +431,10 @@ async function pool(limit, tasks) {
 
 // 未读小红点信号（post_list onlyUnread=true）调研结论：该集合包含点赞/弹幕等所有未读互动，
 // 且在官方端被阅读前永不消失——作为增量候选会让集合永远很大。新评论一定会让 commentCount +1，
-// 所以增量采集只按评论数差值驱动，每 12 轮全量兜底漂移。
+// 所以增量采集按评论数差值驱动，每 12 轮全量兜底漂移。
+// 差值驱动的盲区：删一条+新增一条时 commentCount 不变，新评论会漏到下一轮全量。
+// 缓解：近 7 天发布的视频每轮都重采（新视频互动密度高，量也可控）。
+const RECENT_VIDEO_SEC = 7 * 86400;
 
 async function wxCollectComments(acc, result, full, prevCounts) {
   let targets;
@@ -392,11 +442,12 @@ async function wxCollectComments(acc, result, full, prevCounts) {
     targets = db.prepare("SELECT objectId FROM videos WHERE platform='wechat' AND accountId=? AND commentCount > 0")
       .all(acc.id).map((r) => r.objectId);
   } else {
-    // 增量：评论数变化 ∪ 从没采过评论的
-    const rows = db.prepare("SELECT objectId, commentCount FROM videos WHERE platform='wechat' AND accountId=? AND commentCount > 0")
+    // 增量：评论数变化 ∪ 从没采过评论的 ∪ 近 7 天发布的
+    const cutoff = Math.floor(Date.now() / 1000) - RECENT_VIDEO_SEC;
+    const rows = db.prepare("SELECT objectId, commentCount, createTime FROM videos WHERE platform='wechat' AND accountId=? AND commentCount > 0")
       .all(acc.id);
     targets = rows
-      .filter((r) => prevCounts.get(r.objectId) !== r.commentCount)
+      .filter((r) => prevCounts.get(r.objectId) !== r.commentCount || (r.createTime || 0) > cutoff)
       .map((r) => r.objectId);
     result.incremental = { total: rows.length, hit: targets.length };
   }
@@ -440,7 +491,10 @@ async function wxFetchProfile(acc) {
   const r = await wxApi(acc, '/cgi-bin/mmfinderassistant-bin/auth/auth_data', {});
   const f = r.data?.finderUser;
   if (r.errCode === 0 && f) {
-    saveAccountProfile(acc.id, { nickname: f.nickname, headImgUrl: f.headImgUrl, followers: f.fansCount });
+    saveAccountProfile(acc.id, {
+      nickname: f.nickname, headImgUrl: f.headImgUrl, followers: f.fansCount,
+      username: f.username, // finderUsername，私信 self 判定用
+    });
   }
 }
 
@@ -474,11 +528,13 @@ async function dyApi(acc, p) {
   try {
     r = JSON.parse(text);
   } catch {
-    setCookieValid(acc.id, false);
-    throw new Error(`抖音上游返回非 JSON (HTTP ${res.status})，cookie 可能已失效: ${text.slice(0, 120)}`);
+    // 只有 401/403 才视为登录失效；502/网关错误等只是上游临时故障
+    if (res.status === 401 || res.status === 403) setCookieValid(acc.id, false);
+    const hint = res.status === 401 || res.status === 403 ? '，cookie 可能已失效' : '';
+    throw new Error(`抖音上游返回非 JSON (HTTP ${res.status})${hint}: ${text.slice(0, 120)}`);
   }
   if (r.status_code != null && r.status_code !== 0) {
-    setCookieValid(acc.id, false);
+    if (isAuthError(r.status_msg || r.status_message)) setCookieValid(acc.id, false);
     throw new Error(`抖音接口 status_code=${r.status_code} status_msg=${r.status_msg || r.status_message || ''}`);
   }
   return r;
@@ -525,16 +581,18 @@ function dySaveComment(acc, awemeId, c, rootCommentId = '') {
   const id = String(c.cid || '');
   if (!id) return;
   const u = c.user || {};
+  const nick = String(u.nickname || '');
   upComment.run(
     'douyin', acc.id,
     id,
     String(awemeId),
-    String(u.nickname || ''),
+    nick,
     String(c.text || ''),
     pick(u, ['avatar_thumb.url_list', 'avatar_larger.url_list', 'avatar_url', 'avatar']),
     Number(c.create_time) || 0,
     Number(c.digg_count) || 0,
     String(rootCommentId || ''),
+    authorFlag(acc, nick),
   );
 }
 
@@ -552,6 +610,26 @@ async function dyCollectVideos(acc, result) {
   }
 }
 
+// 二级回复分页：reply_comment 内联只带前几条，超出的走 reply 列表接口补全。
+// 注意：reply 端点按主列表同前缀推断（list/select → list/reply），未实测验证；
+// 失败被吞掉只影响楼中楼完整性，不影响主评论采集。
+async function dyCollectReplies(acc, awemeId, c, result) {
+  const total = Number(c.reply_comment_total) || 0;
+  const inline = (c.reply_comment || []).length;
+  if (total <= inline) return;
+  let cursor = inline;
+  for (let page = 0; page < 10; page++) {
+    let r;
+    try {
+      r = await dyApi(acc, `${DY_COMMENT_API.replace('/list/select/', '/list/reply/')}?item_id=${encodeURIComponent(awemeId)}&comment_id=${encodeURIComponent(c.cid)}&cursor=${cursor}&count=20&aid=2906`);
+    } catch { return; }
+    const list = r.comments || [];
+    for (const l2 of list) { dySaveComment(acc, awemeId, l2, c.cid); result.comments++; }
+    if (!r.has_more || !list.length) return;
+    cursor = Number(r.cursor) || cursor + list.length;
+  }
+}
+
 async function dyCollectCommentsForVideo(acc, awemeId, result) {
   let cursor = 0;
   for (let page = 0; page < 30; page++) {
@@ -560,6 +638,7 @@ async function dyCollectCommentsForVideo(acc, awemeId, result) {
     for (const c of list) {
       dySaveComment(acc, awemeId, c); result.comments++;
       for (const l2 of c.reply_comment || []) { dySaveComment(acc, awemeId, l2, c.cid); result.comments++; }
+      await dyCollectReplies(acc, awemeId, c, result);
     }
     if (!r.has_more || !list.length) break;
     cursor = Number(r.cursor) || cursor + list.length;
@@ -572,9 +651,12 @@ async function dyCollectComments(acc, result, full, prevCounts) {
     targets = db.prepare("SELECT objectId FROM videos WHERE platform='douyin' AND accountId=? AND commentCount > 0")
       .all(acc.id).map((r) => r.objectId);
   } else {
-    const rows = db.prepare("SELECT objectId, commentCount FROM videos WHERE platform='douyin' AND accountId=? AND commentCount > 0")
+    const cutoff = Math.floor(Date.now() / 1000) - RECENT_VIDEO_SEC;
+    const rows = db.prepare("SELECT objectId, commentCount, createTime FROM videos WHERE platform='douyin' AND accountId=? AND commentCount > 0")
       .all(acc.id);
-    targets = rows.filter((r) => prevCounts.get(r.objectId) !== r.commentCount).map((r) => r.objectId);
+    targets = rows
+      .filter((r) => prevCounts.get(r.objectId) !== r.commentCount || (r.createTime || 0) > cutoff)
+      .map((r) => r.objectId);
     result.incremental = { total: rows.length, hit: targets.length };
   }
   await pool(4, targets.map((objectId) => () => dyCollectCommentsForVideo(acc, objectId, result)));
@@ -656,6 +738,9 @@ async function collectAll(trigger = 'auto') {
   result.ok = result.errors.length === 0;
   result.elapsedSec = Math.floor(Date.now() / 1000) - startedAt;
   db.prepare('INSERT INTO collect_log(ts,result) VALUES(?,?)').run(startedAt, JSON.stringify(result));
+  // retention：采集日志只留最近 200 条；头像缓存清 7 天前（过期缓存仅供代理失败时兜底，无需长期保留）
+  db.prepare('DELETE FROM collect_log WHERE id NOT IN (SELECT id FROM collect_log ORDER BY id DESC LIMIT 200)').run();
+  db.prepare('DELETE FROM avatar_cache WHERE ts < ?').run(startedAt - 7 * 86400);
   collecting = false;
   console.log(`[collect] ${trigger} ok=${result.ok} full=${full}`, JSON.stringify(result));
   return result;
@@ -713,15 +798,14 @@ function accountCond(col, ids, args) {
 // ---------- 待处理判定 ----------
 // 一条顶级评论「待处理」= 不是我方账号发的 && 楼中楼没有我方回复 && 未手动标记完成
 // 一个私信会话「待处理」= 最后一条消息是对方发的 && 未手动标记完成
-const OWN_NICK_SQL = `(SELECT COALESCE(nickname,'') FROM accounts WHERE id = %s)`;
+// 「我方」以采集时写入的 comments.isAuthor 快照为准（昵称撞名属尽力判断，改名不影响存量）
 function pendingCommentCond(alias) {
   return `(${alias}.rootCommentId = ''
-    AND (${OWN_NICK_SQL.replace('%s', alias + '.accountId')} = '' OR ${alias}.nickname <> ${OWN_NICK_SQL.replace('%s', alias + '.accountId')})
+    AND COALESCE(${alias}.isAuthor, 0) = 0
     AND NOT EXISTS (
       SELECT 1 FROM comments r
       WHERE r.platform = ${alias}.platform AND r.accountId = ${alias}.accountId
-        AND r.rootCommentId = ${alias}.commentId
-        AND ${OWN_NICK_SQL.replace('%s', 'r.accountId')} <> '' AND r.nickname = ${OWN_NICK_SQL.replace('%s', 'r.accountId')})
+        AND r.rootCommentId = ${alias}.commentId AND COALESCE(r.isAuthor, 0) = 1)
     AND NOT EXISTS (
       SELECT 1 FROM handled_marks h
       WHERE h.platform = ${alias}.platform AND h.accountId = ${alias}.accountId
@@ -796,9 +880,11 @@ function logSent(type, target, content, upstream) {
     .run(Math.floor(Date.now() / 1000), type, target, content, JSON.stringify(upstream).slice(0, 2000));
 }
 
-async function replyToComment(platform, commentId, content) {
+async function replyToComment(platform, accountId, commentId, content) {
   if (platform !== 'wechat') throw new Error(`${PLATFORMS[platform]?.name || platform} 回复暂未接入`);
-  const c = db.prepare("SELECT * FROM comments WHERE platform='wechat' AND commentId = ?").get(commentId);
+  // commentId 跨账号不保证唯一，必须按 (platform, accountId, commentId) 定位，避免用错账号回复
+  const c = db.prepare("SELECT * FROM comments WHERE platform='wechat' AND accountId = ? AND commentId = ?")
+    .get(accountId, commentId);
   if (!c) throw new Error('评论不存在或未采集');
   const acc = getAccount(c.accountId);
   if (!acc || !acc.cookie) throw new Error('该评论所属账号无 cookie');
@@ -1157,7 +1243,7 @@ async function wxLoginChoose(s, finderUsername) {
     try {
       const r2 = await wxLoginCgi(s, '/auth/auth_data', {});
       const f = r2.data?.finderUser;
-      if (f) saveAccountProfile(acc.id, { nickname: f.nickname, headImgUrl: f.headImgUrl, followers: f.fansCount });
+      if (f) saveAccountProfile(acc.id, { nickname: f.nickname, headImgUrl: f.headImgUrl, followers: f.fansCount, username: f.username });
     } catch { /* 非关键 */ }
   }
   s.status = 'done';
@@ -1307,7 +1393,6 @@ const routes = {
     const objectId = u.searchParams.get('objectId') || '';
     const all = db.prepare('SELECT * FROM comments WHERE platform = ? AND accountId = ? AND exportId = ? ORDER BY createTime ASC')
       .all(platform, accountId, objectId);
-    const ownNick = db.prepare('SELECT nickname FROM accounts WHERE id = ?').get(accountId)?.nickname || '';
     const marks = handledSet(platform, accountId, 'comment');
     const tops = all.filter((c) => !c.rootCommentId);
     const topIds = new Set(tops.map((c) => c.commentId));
@@ -1321,8 +1406,8 @@ const routes = {
     const withFlags = (c) => {
       const replies = byRoot[c.commentId] || [];
       const pending = Boolean(
-        (!ownNick || c.nickname !== ownNick) &&
-        !(ownNick && replies.some((r) => r.nickname === ownNick)) &&
+        !c.isAuthor &&
+        !replies.some((r) => r.isAuthor) &&
         !marks.has(c.commentId));
       return { ...c, pending, replies };
     };
@@ -1378,12 +1463,15 @@ const routes = {
         (SELECT fromUsername FROM dm_messages m WHERE m.platform = s.platform AND m.accountId = s.accountId AND m.sessionId = s.sessionId ORDER BY ts DESC LIMIT 1) AS lastFrom,
         (SELECT COUNT(*) FROM dm_messages m WHERE m.platform = s.platform AND m.accountId = s.accountId AND m.sessionId = s.sessionId) AS msgCount
       FROM dm_sessions s WHERE ${cond} ORDER BY lastTs DESC`).all(...args);
+    // 一次性取全部会话标记，避免每会话一次查询（N+1）
+    const sessionMarks = new Set(
+      db.prepare("SELECT platform || ':' || accountId || ':' || targetId AS k FROM handled_marks WHERE kind='session'")
+        .all().map((r) => r.k));
     for (const s of list) {
       s.unread = 0; // demo 不做真未读
       // 待处理 = 最后一条是对方发的 && 未手动标记
-      const marked = db.prepare("SELECT 1 FROM handled_marks WHERE platform=? AND accountId=? AND kind='session' AND targetId=?")
-        .get(s.platform, s.accountId, s.sessionId);
-      s.pending = Boolean(s.lastFrom && s.lastFrom === s.username && !marked);
+      s.pending = Boolean(s.lastFrom && s.lastFrom === s.username
+        && !sessionMarks.has(`${s.platform}:${s.accountId}:${s.sessionId}`));
     }
     const filtered = statusFilter === 'pending' ? list.filter((s) => s.pending)
       : statusFilter === 'done' ? list.filter((s) => !s.pending)
@@ -1493,6 +1581,7 @@ const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = u.pathname;
     if (pathname.startsWith('/api/')) {
+      if (!apiAuthed(req, u)) return sendJson(res, 401, { error: 'unauthorized' });
       if (pathname.startsWith('/api/library/')) return await libraryHandle(req, res, u);
       const key = `${req.method} ${pathname}`;
       if (routes[key]) return await routes[key](req, res, u);
@@ -1566,6 +1655,12 @@ const server = http.createServer(async (req, res) => {
             results.push({ accountId: acc.id, label: acc.label, platform: acc.platform, ok: false, error: String(e && e.message || e) });
           }
         }
+        // 草稿流程结束，清理临时上传文件（素材库的文件在 /api/library 体系内，不受影响）
+        for (const p of [videoPath, coverPath]) {
+          if (p && p.startsWith(UPLOAD_DIR) && fs.existsSync(p)) {
+            try { fs.unlinkSync(p); } catch { /* ignore */ }
+          }
+        }
         return sendJson(res, 200, { ok: results.every((r) => r.ok), results });
       }
       // 账号 cookie 更新/删除
@@ -1580,9 +1675,22 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true });
       }
       const mAcc = pathname.match(/^\/api\/accounts\/(\d+)$/);
+      // 删除账号（级联清理历史数据）
       if (req.method === 'DELETE' && mAcc) {
         const id = Number(mAcc[1]);
-        db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
+        // 级联清理该账号的历史数据与待处理标记，避免残留孤儿数据继续计入统计
+        db.exec('BEGIN');
+        try {
+          for (const t of ['videos', 'comments', 'dm_sessions', 'dm_messages']) {
+            db.prepare(`DELETE FROM ${t} WHERE accountId = ?`).run(id);
+          }
+          db.prepare('DELETE FROM handled_marks WHERE accountId = ?').run(id);
+          db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
+          db.exec('COMMIT');
+        } catch (e) {
+          db.exec('ROLLBACK');
+          throw e;
+        }
         return sendJson(res, 200, { ok: true });
       }
       // 账号编辑（备注/移动分组）
@@ -1629,6 +1737,16 @@ const server = http.createServer(async (req, res) => {
           'SELECT * FROM dm_messages WHERE platform = ? AND accountId = ? AND sessionId = ? ORDER BY ts DESC LIMIT ?')
           .all(platform, accountId, sid, limit);
         rows.reverse();
+        // self 判定放服务端：优先比对会话对方 username；缺失时退到账号自身 finderUsername，
+        // 都没有才用 v2_ 前缀启发式（旧前端在 username 为空时会把所有消息误判成自己发的）
+        const peer = db.prepare('SELECT username FROM dm_sessions WHERE platform=? AND accountId=? AND sessionId=?')
+          .get(platform, accountId, sid)?.username || '';
+        const accUser = peer ? '' : String(db.prepare('SELECT username FROM accounts WHERE id=?').get(accountId)?.username || '');
+        for (const msg of rows) {
+          msg.self = peer ? msg.fromUsername !== peer
+            : accUser ? msg.fromUsername === accUser
+            : String(msg.fromUsername || '').startsWith('v2_');
+        }
         return sendJson(res, 200, { list: rows });
       }
       const mReply = pathname.match(/^\/api\/comments\/([^/]+)\/reply$/);
@@ -1636,9 +1754,11 @@ const server = http.createServer(async (req, res) => {
         const body = await readBody(req);
         const content = String(body.content || '').trim();
         const platform = String(body.platform || 'wechat');
+        const accountId = Number(body.accountId) || 0;
         if (!content) return sendJson(res, 400, { ok: false, error: '内容为空' });
+        if (!accountId) return sendJson(res, 400, { ok: false, error: '缺少 accountId' });
         try {
-          const r = await enqueueWrite(() => replyToComment(platform, decodeURIComponent(mReply[1]), content));
+          const r = await enqueueWrite(() => replyToComment(platform, accountId, decodeURIComponent(mReply[1]), content));
           return sendJson(res, 200, { ok: true, ...r });
         } catch (e) {
           return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
@@ -1667,11 +1787,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  // 上传大文件耗时长，放宽请求超时
-  server.requestTimeout = 0;
-  server.headersTimeout = 120000;
-  console.log(`[inbox] listening on :${PORT}, db=${DB_PATH}, static=${STATIC_DIR}`);
-  collectAll('startup');
-  setInterval(() => { collectAll('interval').catch(console.error); }, 5 * 60 * 1000);
-});
+if (require.main === module) {
+  server.listen(PORT, () => {
+    // 上传大文件耗时长，放宽请求超时
+    server.requestTimeout = 0;
+    server.headersTimeout = 120000;
+    console.log(`[inbox] listening on :${PORT}, db=${DB_PATH}, static=${STATIC_DIR}`);
+    collectAll('startup');
+    setInterval(() => { collectAll('interval').catch(console.error); }, 5 * 60 * 1000);
+  });
+}
+
+// 纯逻辑导出供单元测试（require 本文件不会启动服务/采集）
+module.exports = {
+  dyParseTime, pick, isAuthError, avatarHostAllowed, accountCond, pendingCommentCond,
+};

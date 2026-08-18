@@ -1,0 +1,6 @@
+{
+  "name": "creator-inbox-server",
+  "private": true,
+  "type": "commonjs",
+  "description": "Zero-dependency Node backend (overrides root package.json type:module so require() works)"
+}

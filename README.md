@@ -51,25 +51,40 @@ Creators today juggle: comments scattered across platforms, DMs buried in apps, 
 ### Option A — Docker (recommended for NAS/home server)
 
 ```bash
+npm install && npm run build   # dist/ is gitignored; the image COPYs it
 docker build -t creator-inbox .
 docker run -d -p 8877:8877 \
   -v /path/to/data:/app/data \
   -v /path/to/assets:/media \
   -e PORT=8877 \
+  -e AUTH_TOKEN=change-me \
   creator-inbox
 ```
 
 Open `http://<host>:8877` — done.
 
+**Environment variables** / 环境变量:
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `8877` | HTTP listen port |
+| `DB_PATH` | `./data/inbox.db` | SQLite file path (created with `chmod 600`) |
+| `AUTH_TOKEN` | *(empty = no auth)* | Access token. When set, all `/api/*` requests require `Authorization: Bearer <token>` — the web UI prompts for it once and remembers it. **Strongly recommended on NAS / LAN deployments.** |
+| `MEDIA_ROOT` | *(empty)* | NAS media directory for the library scan |
+| `THUMB_DIR` | `./data/thumbs` | Generated thumbnails |
+
 ### Option B — Local dev
 
 ```bash
-# Backend (Node 22+, zero npm install needed for server)
+# Backend (Node 22.5+；早期 22.x 需 --experimental-sqlite 才能用 node:sqlite，近期 22.x / 23.4+ / 24 免 flag)
 node server/index.js            # listens on :8877
 
 # Frontend (Vite + React + TS)
 npm install
 npm run dev                     # dev server with HMR
+
+# Tests (pure-logic unit tests, zero deps)
+npm test
 ```
 
 ### Configure accounts
@@ -79,7 +94,7 @@ npm run dev                     # dev server with HMR
 3. Paste the platform cookie (browser cookie for your creator account) — stored locally in SQLite
 4. Hit **Refresh** — the collector pulls new videos, comments & DM sessions
 
-> 🔒 Cookies are stored in your local DB only. This is a BYO-cookie tool: you own the data, you own the credentials.
+> 🔒 Cookies are stored in your local DB only (file created `chmod 600`). This is a BYO-cookie tool: you own the data, you own the credentials. Set `AUTH_TOKEN` to password-protect the API & UI on shared networks.
 
 ## 🖼️ Features
 

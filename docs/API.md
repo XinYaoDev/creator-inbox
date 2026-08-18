@@ -2,7 +2,16 @@
 
 Base URL: `http://<host>:8877`
 
-All responses are JSON. Auth: not required (bind to trusted network / use reverse proxy for auth).
+All responses are JSON.
+
+## Authentication
+
+If `AUTH_TOKEN` is unset, `/api/*` is open (fine on localhost). **On NAS / LAN, set `AUTH_TOKEN`.** Then every `/api/*` request must present the token as either:
+
+- `Authorization: Bearer <token>` (the web UI does this after you paste it once; stored in `localStorage`)
+- `?token=<token>` query param — for `<img>` / `<video>` src that cannot send headers
+
+Missing/wrong token → `401`. Static UI assets are still served without auth so the token prompt can load.
 
 ## Status & Overview
 

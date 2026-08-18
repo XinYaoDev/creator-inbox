@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { api, withToken } from './api'
 
 type FacetTag = { id: number; label: string; count: number }
 type FacetNode = { name: string; tags: FacetTag[] }
@@ -61,13 +62,13 @@ export default function LibraryTab({ onBack }: { onBack: () => void }) {
     if (source !== 'all') params.set('source', source)
     if (q.trim()) params.set('q', q.trim())
     for (const t of selTags) params.append('tag', t)
-    const d = await fetch(`/api/library/assets?${params}`).then((r) => r.json())
+    const d = await api(`/api/library/assets?${params}`).then((r) => r.json())
     setAssets(d.list || [])
     setTotal(d.total || 0)
   }
 
   const loadTax = async () => {
-    const d = await fetch('/api/library/taxonomy').then((r) => r.json())
+    const d = await api('/api/library/taxonomy').then((r) => r.json())
     setFacets(d.facets || [])
   }
 
@@ -85,7 +86,7 @@ export default function LibraryTab({ onBack }: { onBack: () => void }) {
   useEffect(() => {
     let t: ReturnType<typeof setInterval> | null = null
     const poll = async () => {
-      const s = await fetch('/api/library/scan/status').then((r) => r.json())
+      const s = await api('/api/library/scan/status').then((r) => r.json())
       setScan(s)
       if (!s.running) {
         if (t) clearInterval(t)
@@ -101,7 +102,7 @@ export default function LibraryTab({ onBack }: { onBack: () => void }) {
   }, [scan?.running])
 
   const startScan = async () => {
-    const r = await fetch('/api/library/scan', { method: 'POST' }).then((x) => x.json())
+    const r = await api('/api/library/scan', { method: 'POST' }).then((x) => x.json())
     if (r.started) {
       setToast(`开始扫描：共 ${r.total} 个，新增 ${r.new}`)
       setScan((s) => ({ ...(s || { errors: [], startedAt: 0, finishedAt: 0 }), running: true, total: r.total, done: 0 }))
@@ -113,13 +114,13 @@ export default function LibraryTab({ onBack }: { onBack: () => void }) {
   }
 
   const openAsset = async (id: string) => {
-    const d = await fetch(`/api/library/assets/${id}`).then((r) => r.json())
+    const d = await api(`/api/library/assets/${id}`).then((r) => r.json())
     setCur(d)
   }
 
   const addTag = async (facet: string, label: string) => {
     if (!cur || !label.trim()) return
-    const r = await fetch(`/api/library/assets/${cur.id}/tags`, {
+    const r = await api(`/api/library/assets/${cur.id}/tags`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ facet, label: label.trim() }),
@@ -137,7 +138,7 @@ export default function LibraryTab({ onBack }: { onBack: () => void }) {
 
   const delTag = async (taxonomyId: number) => {
     if (!cur) return
-    await fetch(`/api/library/assets/${cur.id}/tags/${taxonomyId}`, { method: 'DELETE' })
+    await api(`/api/library/assets/${cur.id}/tags/${taxonomyId}`, { method: 'DELETE' })
     openAsset(cur.id)
     load()
     loadTax()
@@ -148,7 +149,7 @@ export default function LibraryTab({ onBack }: { onBack: () => void }) {
     setBusy(true)
     try {
       for (const f of Array.from(files)) {
-        await fetch(`/api/library/upload?filename=${encodeURIComponent(f.name)}`, {
+        await api(`/api/library/upload?filename=${encodeURIComponent(f.name)}`, {
           method: 'POST',
           body: f,
         })
@@ -256,7 +257,7 @@ export default function LibraryTab({ onBack }: { onBack: () => void }) {
               onClick={() => openAsset(a.id)}
             >
               {a.thumb_path ? (
-                <img className="lthumb" src={`/api/library/thumb?id=${a.id}`} loading="lazy" alt="" />
+                <img className="lthumb" src={withToken(`/api/library/thumb?id=${a.id}`)} loading="lazy" alt="" />
               ) : (
                 <div className="lthumb lthumb-fallback">{a.file_type === 'video' ? '🎬' : '🖼'}</div>
               )}
@@ -287,9 +288,9 @@ export default function LibraryTab({ onBack }: { onBack: () => void }) {
               <button className="linkbtn" onClick={() => setCur(null)}>✕</button>
             </div>
             {cur.file_type === 'video' ? (
-              <video className="ld-video" src={`/api/library/file?id=${cur.id}`} controls preload="metadata" />
+              <video className="ld-video" src={withToken(`/api/library/file?id=${cur.id}`)} controls preload="metadata" />
             ) : (
-              <img className="ld-video" src={`/api/library/file?id=${cur.id}`} alt="" />
+              <img className="ld-video" src={withToken(`/api/library/file?id=${cur.id}`)} alt="" />
             )}
             <div className="ld-meta mono">
               <div className="ld-row">

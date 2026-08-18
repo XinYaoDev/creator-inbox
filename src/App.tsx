@@ -1,829 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import LibraryTab from './LibraryTab'
-
-type PlatformInfo = { name: string; cookieValid: boolean | null; hasCookie: boolean; accountCount: number }
-type Status = {
-  lastCollect: number | null
-  collecting: boolean
-  platforms: Record<string, PlatformInfo>
-  lastError: string | null
-  counts: {
-    videos: number
-    comments: number
-    sessions: number
-    messages: number
-    pendingComments: number
-    pendingSessions: number
-    byPlatform: Record<string, { videos: number; comments: number }>
-  }
-}
-type Group = { id: number; name: string; createdAt: number }
-type Account = {
-  id: number
-  groupId: number
-  platform: string
-  platformName: string
-  label: string
-  nickname: string
-  headImgUrl: string
-  followers: number | null
-  hasCookie: boolean
-  cookieValid: boolean | null
-  lastError: string
-  state: 'online' | 'error' | 'expired' | 'none'
-}
-type CommentItem = {
-  platform: string
-  accountId: number
-  commentId: string
-  exportId: string
-  nickname: string
-  content: string
-  headUrl: string
-  createTime: number
-  likeCount: number
-  rootCommentId: string
-  pending?: boolean
-  replies?: CommentItem[]
-}
-type VideoItem = {
-  platform: string
-  accountId: number
-  objectId: string
-  title: string
-  thumbUrl: string
-  createTime: number
-  commentCount: number
-  latestCommentTs: number | null
-  collectedComments: number
-  pendingCount: number
-}
-type SessionItem = {
-  platform: string
-  accountId: number
-  sessionId: string
-  username: string
-  nickname: string
-  headImgUrl: string
-  sessionType: number
-  lastContent: string | null
-  lastTs: number | null
-  lastFrom: string | null
-  msgCount: number
-  unread: number
-  pending: boolean
-}
-type MsgItem = {
-  platform: string
-  accountId: number
-  svrMsgId: string
-  sessionId: string
-  fromUsername: string
-  toUsername: string
-  content: string
-  ts: number
-  msgType: number
-}
-type SearchResults = {
-  comments: { platform: string; accountId: number; commentId: string; exportId: string; nickname: string; content: string; createTime: number; videoTitle: string | null }[]
-  sessions: { platform: string; accountId: number; sessionId: string; nickname: string; headImgUrl: string }[]
-}
-
-const fmtTime = (s?: number | null) =>
-  s ? new Date(s * 1000).toLocaleString('zh-CN', { hour12: false }) : '—'
-const proxied = (url?: string | null) =>
-  url ? `/api/avatar?url=${encodeURIComponent(url)}` : ''
-
-function Avatar({ url, name }: { url?: string | null; name?: string }) {
-  if (url) return <img className="avatar" src={proxied(url)} alt="" loading="lazy" />
-  return <div className="avatar avatar-fallback">{(name || '?').slice(0, 1)}</div>
-}
-
-function ReplyBox({ commentId, platform, onSent }: { commentId: string; platform: string; onSent: () => void }) {
-  const [text, setText] = useState('')
-  const [sending, setSending] = useState(false)
-  const [err, setErr] = useState('')
-  const send = async () => {
-    if (!text.trim() || sending) return
-    setSending(true)
-    setErr('')
-    try {
-      const r = await fetch(`/api/comments/${encodeURIComponent(commentId)}/reply`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: text.trim(), platform }),
-      }).then((x) => x.json())
-      if (r.ok) {
-        setText('')
-        onSent()
-      } else {
-        setErr(r.error || '发送失败')
-      }
-    } catch (e) {
-      setErr(String(e))
-    } finally {
-      setSending(false)
-    }
-  }
-  return (
-    <div className="replybox">
-      <input
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => e.key === 'Enter' && send()}
-        placeholder="友善回复…"
-        disabled={sending}
-      />
-      <button className="btn" onClick={send} disabled={sending || !text.trim()}>
-        {sending ? '发送中…' : '发送'}
-      </button>
-      {err && <span className="send-err">{err}</span>}
-    </div>
-  )
-}
-
-function CommentRow({
-  c,
-  indent,
-  onSent,
-  onToggleDone,
-}: {
-  c: CommentItem
-  indent?: boolean
-  onSent: () => void
-  onToggleDone: (c: CommentItem, done: boolean) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const canReply = c.platform === 'wechat' // 抖音回复暂未接入
-  return (
-    <div className={indent ? 'comment indent' : c.pending ? 'comment pending' : 'comment'}>
-      <Avatar url={c.headUrl} name={c.nickname} />
-      <div className="row-main">
-        <div className="row-head">
-          <span className="nick">{c.nickname || '匿名'}</span>
-          <span className="time mono">{fmtTime(c.createTime)}</span>
-        </div>
-        <div className="content">{c.content}</div>
-        <div className="meta">
-          <span className="mono">赞 {c.likeCount}</span>
-          <span className="meta-actions">
-            {canReply && (
-              <button className="linkbtn" onClick={() => setOpen(!open)}>
-                {open ? '收起' : '回复'}
-              </button>
-            )}
-            {!indent && (
-              <button className="linkbtn" onClick={() => onToggleDone(c, !c.pending)}>
-                {c.pending ? '完成' : '重做'}
-              </button>
-            )}
-          </span>
-        </div>
-        {open && canReply && <ReplyBox commentId={c.commentId} platform={c.platform} onSent={onSent} />}
-      </div>
-    </div>
-  )
-}
-
-function PublishTab({ groups, accounts }: { groups: Group[]; accounts: Account[] }) {
-  const [file, setFile] = useState<File | null>(null)
-  const [videoUrl, setVideoUrl] = useState('')
-  const [meta, setMeta] = useState<{ width: number; height: number; duration: number } | null>(null)
-  const [cover, setCover] = useState<Blob | null>(null)
-  const [coverUrl, setCoverUrl] = useState('')
-  const [desc, setDesc] = useState('')
-  const [targetMode, setTargetMode] = useState<'group' | 'account'>('group')
-  const [targetId, setTargetId] = useState<number>(0)
-  const [stage, setStage] = useState('')
-  const [results, setResults] = useState<{ label: string; platform: string; ok: boolean; error?: string; objectId?: string }[]>([])
-  const [err, setErr] = useState('')
-  const videoRef = useRef<HTMLVideoElement>(null)
-
-  const reset = () => {
-    setMeta(null)
-    setCover(null)
-    setCoverUrl('')
-    setResults([])
-    setErr('')
-  }
-
-  const pickFile = (f: File | null) => {
-    reset()
-    setFile(f)
-    setVideoUrl(f ? URL.createObjectURL(f) : '')
-  }
-
-  // 视频加载出元数据后定位到 1s 处抽封面
-  const onLoadedMeta = () => {
-    const v = videoRef.current
-    if (!v) return
-    setMeta({ width: v.videoWidth, height: v.videoHeight, duration: Math.round(v.duration) })
-    v.currentTime = Math.min(1, (v.duration || 2) / 2)
-  }
-  const onSeeked = () => {
-    const v = videoRef.current
-    if (!v || cover) return
-    const c = document.createElement('canvas')
-    c.width = v.videoWidth
-    c.height = v.videoHeight
-    const ctx = c.getContext('2d')
-    if (!ctx) return
-    ctx.drawImage(v, 0, 0)
-    c.toBlob(
-      (b) => {
-        if (b) {
-          setCover(b)
-          setCoverUrl(URL.createObjectURL(b))
-        }
-      },
-      'image/jpeg',
-      0.85,
-    )
-  }
-  const pickCover = (f: File | null) => {
-    if (!f) return
-    setCover(f)
-    setCoverUrl(URL.createObjectURL(f))
-  }
-
-  const submit = async () => {
-    if (!file || !meta || stage) return
-    if (!targetId) {
-      setErr(targetMode === 'group' ? '请选择分组' : '请选择账号')
-      return
-    }
-    setErr('')
-    setResults([])
-    try {
-      setStage('上传视频到服务器…')
-      const up = await fetch(`/api/upload/file?kind=video&filename=${encodeURIComponent(file.name)}`, {
-        method: 'POST',
-        body: file,
-      }).then((r) => r.json())
-      if (!up.ok) throw new Error(up.error || '视频上传失败')
-      let coverId = ''
-      if (cover) {
-        setStage('上传封面…')
-        const cu = await fetch('/api/upload/file?kind=cover&filename=cover.jpg', {
-          method: 'POST',
-          body: cover,
-        }).then((r) => r.json())
-        if (cu.ok) coverId = cu.id
-      }
-      setStage('分片上传到视频号 CDN 并存草稿（多账号逐个执行，需几分钟）…')
-      const dr = await fetch('/api/upload/draft', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          videoId: up.id,
-          coverId,
-          description: desc.trim(),
-          ...(targetMode === 'group' ? { groupId: targetId } : { accountId: targetId }),
-          ...meta,
-        }),
-      }).then((r) => r.json())
-      setResults(dr.results || [])
-      setStage('')
-    } catch (e) {
-      setErr(String((e as Error)?.message || e))
-      setStage('')
-    }
-  }
-
-  const wxAccounts = accounts.filter((a) => a.platform === 'wechat')
-
-  return (
-    <main className="pubform">
-      <div className="pub-block">
-        <div className="pub-label">视频文件（只存草稿，不直接发表）</div>
-        <input type="file" accept="video/*" onChange={(e) => pickFile(e.target.files?.[0] || null)} />
-      </div>
-      {videoUrl && (
-        <div className="pub-preview">
-          <video
-            ref={videoRef}
-            src={videoUrl}
-            className="pub-video"
-            muted
-            playsInline
-            onLoadedMetadata={onLoadedMeta}
-            onSeeked={onSeeked}
-          />
-          <div className="pub-side">
-            {meta && (
-              <div className="mono pub-meta">
-                {meta.width}×{meta.height} · {meta.duration}s ·{' '}
-                {file ? (file.size / 1024 / 1024).toFixed(1) : '?'}MB
-              </div>
-            )}
-            <div className="pub-label">
-              封面（自动抽帧，可换）{' '}
-              <label className="linkbtn">
-                选择图片
-                <input
-                  type="file"
-                  accept="image/*"
-                  style={{ display: 'none' }}
-                  onChange={(e) => pickCover(e.target.files?.[0] || null)}
-                />
-              </label>
-            </div>
-            {coverUrl && <img className="pub-cover" src={coverUrl} alt="封面" />}
-          </div>
-        </div>
-      )}
-      <div className="pub-block">
-        <div className="pub-label">文案</div>
-        <textarea
-          className="pub-desc"
-          rows={3}
-          value={desc}
-          onChange={(e) => setDesc(e.target.value)}
-          placeholder="视频描述…"
-        />
-      </div>
-      <div className="pub-block">
-        <div className="pub-label">发表目标（仅视频号账号会执行，抖音上传暂未接入）</div>
-        <div className="pub-target">
-          <select value={targetMode} onChange={(e) => { setTargetMode(e.target.value as 'group' | 'account'); setTargetId(0) }}>
-            <option value="group">整组</option>
-            <option value="account">单个账号</option>
-          </select>
-          {targetMode === 'group' ? (
-            <select value={targetId} onChange={(e) => setTargetId(Number(e.target.value))}>
-              <option value={0}>选择分组…</option>
-              {groups.map((g) => (
-                <option key={g.id} value={g.id}>{g.name}</option>
-              ))}
-            </select>
-          ) : (
-            <select value={targetId} onChange={(e) => setTargetId(Number(e.target.value))}>
-              <option value={0}>选择账号…</option>
-              {wxAccounts.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.nickname || a.label || `账号${a.id}`}（{a.platformName}）
-                </option>
-              ))}
-            </select>
-          )}
-        </div>
-      </div>
-      <div className="pub-actions">
-        <button className="btn" onClick={submit} disabled={!file || !meta || Boolean(stage)}>
-          {stage || '存为草稿'}
-        </button>
-      </div>
-      {results.length > 0 && (
-        <div className="pub-results">
-          {results.map((r, i) => (
-            <div key={i} className={r.ok ? 'pub-ok' : 'send-err'}>
-              {r.label || `账号${i + 1}`}：{r.ok ? `草稿已创建（${(r.objectId || '').slice(0, 20)}…）` : r.error}
-            </div>
-          ))}
-        </div>
-      )}
-      {err && <div className="send-err">{err}</div>}
-    </main>
-  )
-}
-
-// ---------- 扫码登录弹层 ----------
-function LoginModal({ acc, onClose, onDone }: { acc: Account; onClose: () => void; onDone: () => void }) {
-  const [sessionId, setSessionId] = useState('')
-  const [status, setStatus] = useState('starting') // starting|waiting|scanned|choose|done|expired|error|manual
-  const [error, setError] = useState('')
-  const [finderList, setFinderList] = useState<{ finderUsername: string; nickname: string; headImgUrl: string }[]>([])
-  const [cookieText, setCookieText] = useState('')
-  const sidRef = useRef('')
-
-  const start = useCallback(async () => {
-    setStatus('starting')
-    setError('')
-    const r = await fetch('/api/login/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ accountId: acc.id }),
-    }).then((x) => x.json())
-    if (r.ok) {
-      setSessionId(r.sessionId)
-      sidRef.current = r.sessionId
-      setStatus('waiting')
-    } else {
-      setStatus('error')
-      setError(r.error || '出码失败')
-    }
-  }, [acc.id])
-
-  useEffect(() => { start() }, [start])
-
-  // 轮询登录状态
-  useEffect(() => {
-    if (!sessionId || ['done', 'error', 'expired', 'manual'].includes(status)) return
-    const t = setInterval(async () => {
-      const r = await fetch(`/api/login/status?sessionId=${sessionId}`).then((x) => x.json()).catch(() => null)
-      if (!r || !r.ok) return
-      setStatus(r.status)
-      setError(r.error || '')
-      if (r.finderList) setFinderList(r.finderList)
-      if (r.status === 'done') {
-        onDone()
-        setTimeout(onClose, 1200)
-      }
-    }, 2000)
-    return () => clearInterval(t)
-  }, [sessionId, status, onClose, onDone])
-
-  // 关闭时取消会话
-  useEffect(() => () => {
-    if (sidRef.current) {
-      fetch('/api/login/cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: sidRef.current }),
-      })
-    }
-  }, [])
-
-  const choose = async (finderUsername: string) => {
-    const r = await fetch('/api/login/choose', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId, finderUsername }),
-    }).then((x) => x.json())
-    if (r.ok) {
-      setStatus('done')
-      onDone()
-      setTimeout(onClose, 1200)
-    } else {
-      setStatus('error')
-      setError(r.error || '选号失败')
-    }
-  }
-
-  const saveManual = async () => {
-    const cookie = cookieText.trim()
-    if (!cookie) return
-    const r = await fetch(`/api/accounts/${acc.id}/cookie`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cookie }),
-    }).then((x) => x.json())
-    if (r.ok) {
-      onDone()
-      onClose()
-    } else setError(r.error || '保存失败')
-  }
-
-  return (
-    <div className="modal-mask" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-title">
-          {acc.hasCookie ? '重新登录' : '登录'} · {acc.nickname || acc.label || acc.platformName}
-          <button className="linkbtn modal-x" onClick={onClose}>关闭</button>
-        </div>
-        {status !== 'manual' && (
-          <div className="modal-qr">
-            {sessionId && status !== 'starting' && status !== 'error' ? (
-              <img className="qrimg" src={`/api/login/qr?sessionId=${sessionId}`} alt="登录二维码" />
-            ) : (
-              <div className="qrimg qr-loading">{status === 'starting' ? '出码中…' : '出码失败'}</div>
-            )}
-            <div className="qr-status">
-              {status === 'waiting' && '用微信扫一扫，手机上确认登录'}
-              {status === 'scanned' && '已扫码，请在手机上确认…'}
-              {status === 'confirmed' && '已确认，正在登录…'}
-              {status === 'done' && '✓ 登录成功'}
-              {status === 'expired' && '二维码已过期'}
-              {status === 'error' && (error || '登录失败')}
-            </div>
-            {status === 'choose' && (
-              <div className="qr-choose">
-                <div className="pub-label">这个微信下有多个视频号，选择要登录的：</div>
-                {finderList.map((f) => (
-                  <button key={f.finderUsername} className="btn qr-choice" onClick={() => choose(f.finderUsername)}>
-                    {f.nickname || f.finderUsername}
-                  </button>
-                ))}
-              </div>
-            )}
-            {(status === 'expired' || status === 'error') && (
-              <button className="btn" onClick={start}>重新出码</button>
-            )}
-          </div>
-        )}
-        {status === 'manual' && (
-          <div className="acct-cookie">
-            <textarea
-              rows={4}
-              value={cookieText}
-              onChange={(e) => setCookieText(e.target.value)}
-              placeholder="粘贴 Cookie 请求头整行（DevTools → Network → 任意请求 → Cookie）"
-            />
-            <div className="pub-actions">
-              <button className="btn" onClick={saveManual} disabled={!cookieText.trim()}>保存</button>
-            </div>
-            {error && <div className="send-err">{error}</div>}
-          </div>
-        )}
-        <div className="modal-foot">
-          {status === 'manual' ? (
-            <button className="linkbtn" onClick={() => setStatus('waiting')}>← 返回扫码登录</button>
-          ) : (
-            <button className="linkbtn" onClick={() => setStatus('manual')}>扫码不方便？手动粘贴 Cookie</button>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function AccountsTab({
-  groups,
-  accounts,
-  onChanged,
-  lastCollect,
-  onRecollect,
-}: {
-  groups: Group[]
-  accounts: Account[]
-  onChanged: () => void
-  lastCollect: number | null
-  onRecollect: () => void
-}) {
-  const [selGroup, setSelGroup] = useState<'all' | number>('all')
-  const [newGroup, setNewGroup] = useState('')
-  const [addingGroup, setAddingGroup] = useState(false)
-  const [addForm, setAddForm] = useState(false) // 虚线卡展开
-  const [newLabel, setNewLabel] = useState('')
-  const [newPlatform, setNewPlatform] = useState('wechat')
-  const [msg, setMsg] = useState('')
-  const [confirmDel, setConfirmDel] = useState<string | null>(null)
-  const [loginFor, setLoginFor] = useState<Account | null>(null)
-  const [editingLabel, setEditingLabel] = useState<number | null>(null)
-  const [labelText, setLabelText] = useState('')
-  const [movingFor, setMovingFor] = useState<number | null>(null)
-  const [renaming, setRenaming] = useState(false)
-  const [renameText, setRenameText] = useState('')
-
-  const toast = (s: string) => {
-    setMsg(s)
-    setTimeout(() => setMsg(''), 3000)
-  }
-  const fmtFans = (n: number | null) =>
-    n == null ? '粉丝 —' : n >= 10000 ? `粉丝 ${(n / 10000).toFixed(1)} 万` : `粉丝 ${n}`
-
-  const curGroup = groups.find((g) => g.id === selGroup)
-  const visible = selGroup === 'all' ? accounts : accounts.filter((a) => a.groupId === selGroup)
-  const onlineCount = accounts.filter((a) => a.state === 'online').length
-  const trouble = accounts.filter((a) => a.state === 'error' || a.state === 'expired')
-  const stateText = (a: Account) =>
-    a.state === 'online' ? '在线' : a.state === 'error' ? '异常' : a.state === 'expired' ? '需重新登录' : '未登录'
-
-  const addGroup = async () => {
-    if (!newGroup.trim()) return
-    const r = await fetch('/api/groups', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newGroup.trim() }),
-    }).then((x) => x.json())
-    if (r.ok) {
-      setNewGroup('')
-      setAddingGroup(false)
-      onChanged()
-    } else toast(r.error || '创建失败')
-  }
-
-  const addAccount = async () => {
-    const groupId = selGroup === 'all' ? groups[0]?.id : Number(selGroup)
-    if (!groupId) {
-      toast('请先创建分组')
-      return
-    }
-    const r = await fetch('/api/accounts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupId, platform: newPlatform, label: newLabel.trim() }),
-    }).then((x) => x.json())
-    if (r.ok) {
-      setNewLabel('')
-      setAddForm(false)
-      onChanged()
-      toast('账号已创建，点「登录」扫码完成登录')
-    } else toast(r.error || '创建失败')
-  }
-
-  const saveLabel = async (a: Account) => {
-    await fetch(`/api/accounts/${a.id}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: labelText.trim() }),
-    })
-    setEditingLabel(null)
-    onChanged()
-  }
-
-  const moveGroup = async (a: Account, groupId: number) => {
-    await fetch(`/api/accounts/${a.id}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupId }),
-    })
-    setMovingFor(null)
-    onChanged()
-  }
-
-  const renameGroup = async () => {
-    if (!curGroup || !renameText.trim()) return
-    await fetch(`/api/groups/${curGroup.id}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: renameText.trim() }),
-    })
-    setRenaming(false)
-    onChanged()
-  }
-
-  const delAccount = async (acc: Account) => {
-    const key = `acc:${acc.id}`
-    if (confirmDel !== key) { setConfirmDel(key); return }
-    setConfirmDel(null)
-    await fetch(`/api/accounts/${acc.id}`, { method: 'DELETE' })
-    onChanged()
-  }
-
-  const delGroup = async (g: Group) => {
-    const key = `grp:${g.id}`
-    if (confirmDel !== key) { setConfirmDel(key); return }
-    setConfirmDel(null)
-    const r = await fetch(`/api/groups/${g.id}`, { method: 'DELETE' }).then((x) => x.json())
-    if (!r.ok) toast(r.error || '删除失败')
-    if (selGroup === g.id) setSelGroup('all')
-    onChanged()
-  }
-
-  return (
-    <main className="acct2">
-      <aside className="gnav">
-        <div className="gnav-title">分组</div>
-        <button className={selGroup === 'all' ? 'gnav-item active' : 'gnav-item'} onClick={() => setSelGroup('all')}>
-          全部账号 <span className="mono">({accounts.length})</span>
-        </button>
-        {groups.map((g) => (
-          <button
-            key={g.id}
-            className={selGroup === g.id ? 'gnav-item active' : 'gnav-item'}
-            onClick={() => setSelGroup(g.id)}
-          >
-            {g.name} <span className="mono">({accounts.filter((a) => a.groupId === g.id).length})</span>
-          </button>
-        ))}
-        {addingGroup ? (
-          <div className="gnav-add">
-            <input
-              autoFocus
-              value={newGroup}
-              onChange={(e) => setNewGroup(e.target.value)}
-              placeholder="如：妈妈账号"
-              onKeyDown={(e) => e.key === 'Enter' && addGroup()}
-            />
-            <button className="linkbtn" onClick={addGroup}>创建</button>
-          </div>
-        ) : (
-          <button className="gnav-item gnav-new" onClick={() => setAddingGroup(true)}>+ 新建分组</button>
-        )}
-      </aside>
-
-      <section className="acct-main">
-        <div className="acct-summary mono">
-          已连接 {accounts.length} 个账号 · {onlineCount} 个在线 · 最近同步 {fmtTime(lastCollect)}
-          {msg && <span className="pub-ok">{msg}</span>}
-        </div>
-
-        {trouble.map((a) => (
-          <div className="errbar acct-err" key={a.id}>
-            ⚠ {a.platformName}账号「{a.nickname || a.label || a.id}」
-            {a.state === 'expired' ? '登录已失效，请重新登录' : `采集失败：${a.lastError.slice(0, 60)}`}
-            <span className="acct-err-actions">
-              {a.state === 'error' && <button className="linkbtn" onClick={onRecollect}>重新采集</button>}
-              <button className="linkbtn" onClick={() => setLoginFor(a)}>重新登录</button>
-            </span>
-          </div>
-        ))}
-
-        <div className="acct-group-head">
-          {renaming && curGroup ? (
-            <span className="gnav-add">
-              <input
-                autoFocus
-                value={renameText}
-                onChange={(e) => setRenameText(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && renameGroup()}
-              />
-              <button className="linkbtn" onClick={renameGroup}>保存</button>
-            </span>
-          ) : (
-            <b>{curGroup ? curGroup.name : '全部账号'} <span className="mono">{visible.length} 个账号</span></b>
-          )}
-          {curGroup && (
-            <span className="acct-group-ops">
-              <button className="linkbtn" onClick={() => { setRenaming(true); setRenameText(curGroup.name) }}>重命名</button>
-              <button
-                className={confirmDel === `grp:${curGroup.id}` ? 'linkbtn danger' : 'linkbtn'}
-                onClick={() => delGroup(curGroup)}
-              >
-                {confirmDel === `grp:${curGroup.id}` ? '确认删除分组？' : '删除分组'}
-              </button>
-            </span>
-          )}
-        </div>
-
-        <div className="acards">
-          {visible.map((a) => (
-            <div className="acard" key={a.id}>
-              <div className={`acard-badge st-${a.state}`}>{stateText(a)}</div>
-              <div className="acard-avatar">
-                {a.headImgUrl ? (
-                  <img src={proxied(a.headImgUrl)} alt="" loading="lazy" />
-                ) : (
-                  <div className="acard-avatar-fallback">{(a.nickname || a.label || '?').slice(0, 1)}</div>
-                )}
-                <span className={`acard-ptag ptag-${a.platform}`}>{a.platformName}</span>
-              </div>
-              <div className="acard-name">{a.nickname || a.label || `账号${a.id}`}</div>
-              <div className="acard-meta mono">
-                {fmtFans(a.followers)}
-                {a.label && a.nickname ? ` · ${a.label}` : ''}
-              </div>
-              {editingLabel === a.id && (
-                <div className="gnav-add">
-                  <input
-                    autoFocus
-                    value={labelText}
-                    onChange={(e) => setLabelText(e.target.value)}
-                    placeholder="备注名"
-                    onKeyDown={(e) => e.key === 'Enter' && saveLabel(a)}
-                  />
-                  <button className="linkbtn" onClick={() => saveLabel(a)}>保存</button>
-                </div>
-              )}
-              {movingFor === a.id && (
-                <select
-                  autoFocus
-                  defaultValue={a.groupId}
-                  onChange={(e) => moveGroup(a, Number(e.target.value))}
-                  onBlur={() => setMovingFor(null)}
-                >
-                  {groups.map((g) => (
-                    <option key={g.id} value={g.id}>{g.name}</option>
-                  ))}
-                </select>
-              )}
-              <div className="acard-actions">
-                <button className="linkbtn" onClick={() => setLoginFor(a)}>
-                  {a.hasCookie ? '重新登录' : '登录'}
-                </button>
-                <button className="linkbtn" onClick={() => { setEditingLabel(a.id); setLabelText(a.label) }}>备注</button>
-                <button className="linkbtn" onClick={() => setMovingFor(a.id)}>移组</button>
-                <button
-                  className={confirmDel === `acc:${a.id}` ? 'linkbtn danger' : 'linkbtn'}
-                  onClick={() => delAccount(a)}
-                >
-                  {confirmDel === `acc:${a.id}` ? '确认？' : '删除'}
-                </button>
-              </div>
-            </div>
-          ))}
-          <div className="acard acard-add" onClick={() => setAddForm(!addForm)}>
-            {addForm ? (
-              <div className="acct-add" onClick={(e) => e.stopPropagation()}>
-                <select value={newPlatform} onChange={(e) => setNewPlatform(e.target.value)}>
-                  <option value="wechat">视频号</option>
-                  <option value="douyin">抖音</option>
-                </select>
-                <input
-                  autoFocus
-                  value={newLabel}
-                  onChange={(e) => setNewLabel(e.target.value)}
-                  placeholder="账号备注名"
-                />
-                <button className="btn" onClick={addAccount}>添加</button>
-              </div>
-            ) : (
-              <span className="acard-add-plus">+ 添加账号</span>
-            )}
-          </div>
-        </div>
-        <div className="pub-label">
-          视频号点「登录」直接扫码；抖音扫码暂未接入，弹层里可切换手动粘贴 Cookie。
-        </div>
-      </section>
-
-      {loginFor && (
-        <LoginModal acc={loginFor} onClose={() => setLoginFor(null)} onDone={onChanged} />
-      )}
-    </main>
-  )
-}
+import PublishTab from './components/PublishTab'
+import AccountsTab from './components/AccountsTab'
+import CommentRow from './components/CommentRow'
+import Avatar from './components/Avatar'
+import { api, setToken } from './api'
+import { fmtTime, proxied } from './utils'
+import type {
+  Account, CommentItem, Group, MsgItem, SearchResults, SessionItem, Status, VideoItem,
+} from './types'
 
 export default function App() {
   const [view, setView] = useState<'inbox' | 'publish' | 'settings' | 'library'>('inbox')
@@ -848,28 +33,37 @@ export default function App() {
   const [searchQ, setSearchQ] = useState('')
   const [searchRes, setSearchRes] = useState<SearchResults | null>(null)
   const [toast, setToast] = useState('')
+  const [needAuth, setNeedAuth] = useState(false)
+  const [tokenInput, setTokenInput] = useState('')
+
+  // 服务端开启 AUTH_TOKEN 后，任一请求 401 即弹出令牌输入框
+  useEffect(() => {
+    const on401 = () => setNeedAuth(true)
+    window.addEventListener('inbox:unauthorized', on401)
+    return () => window.removeEventListener('inbox:unauthorized', on401)
+  }, [])
 
   const loadAccounts = useCallback(async () => {
-    const d = await fetch('/api/accounts').then((r) => r.json())
+    const d = await api('/api/accounts').then((r) => r.json())
     setGroups(d.groups || [])
     setAccounts(d.accounts || [])
   }, [])
 
   const load = useCallback(async () => {
-    const st: Status = await fetch('/api/status').then((r) => r.json())
+    const st: Status = await api('/api/status').then((r) => r.json())
     setStatus(st)
     const params = new URLSearchParams()
     if (platform !== 'all') params.set('platform', platform)
     if (groupFilter !== 'all') params.set('groupId', String(groupFilter))
     params.set('status', statusFilter)
     params.set('sort', videoSort)
-    const vs = await fetch(`/api/videos?${params}`).then((r) => r.json())
+    const vs = await api(`/api/videos?${params}`).then((r) => r.json())
     const list: VideoItem[] = vs.list || []
     setVideoList(list)
     const sq = new URLSearchParams()
     if (groupFilter !== 'all') sq.set('groupId', String(groupFilter))
     sq.set('status', statusFilter)
-    const ss = await fetch(`/api/dm/sessions?${sq}`).then((r) => r.json())
+    const ss = await api(`/api/dm/sessions?${sq}`).then((r) => r.json())
     setSessions(ss.list || [])
   }, [platform, groupFilter, statusFilter, videoSort])
 
@@ -888,7 +82,7 @@ export default function App() {
   const loadVideoComments = useCallback(async (key: string) => {
     const [p, accId, ...rest] = key.split(':')
     const objectId = rest.join(':')
-    const d = await fetch(
+    const d = await api(
       `/api/video/comments?platform=${encodeURIComponent(p)}&accountId=${encodeURIComponent(accId)}&objectId=${encodeURIComponent(objectId)}`,
     ).then((r) => r.json())
     setVideoComments(d.list || [])
@@ -907,7 +101,7 @@ export default function App() {
   const loadMsgs = useCallback(async (key: string) => {
     const [p, accId, ...rest] = key.split(':')
     const sid = rest.join(':')
-    const d = await fetch(
+    const d = await api(
       `/api/dm/sessions/${encodeURIComponent(sid)}/messages?platform=${encodeURIComponent(p)}&accountId=${encodeURIComponent(accId)}`,
     ).then((r) => r.json())
     setMsgs(d.list || [])
@@ -932,11 +126,11 @@ export default function App() {
     if (busy) return
     setBusy(true)
     try {
-      await fetch('/api/collect', { method: 'POST' })
+      await api('/api/collect', { method: 'POST' })
       // 异步采集：轮询 status 直到完成
       for (;;) {
         await new Promise((r) => setTimeout(r, 2000))
-        const st: Status = await fetch('/api/status').then((r) => r.json())
+        const st: Status = await api('/api/status').then((r) => r.json())
         setStatus(st)
         if (!st.collecting) break
       }
@@ -956,7 +150,7 @@ export default function App() {
     setDmSending(true)
     setDmErr('')
     try {
-      const r = await fetch(`/api/dm/sessions/${encodeURIComponent(sid)}/send`, {
+      const r = await api(`/api/dm/sessions/${encodeURIComponent(sid)}/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: dmInput.trim(), accountId: Number(accId) }),
@@ -977,7 +171,7 @@ export default function App() {
 
   // 标记完成/重做
   const toggleDone = async (item: { platform: string; accountId: number }, kind: 'comment' | 'session', targetId: string, done: boolean) => {
-    await fetch('/api/handled', {
+    await api('/api/handled', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ platform: item.platform, accountId: item.accountId, kind, targetId, done }),
@@ -992,7 +186,7 @@ export default function App() {
       return
     }
     const t = setTimeout(async () => {
-      const d = await fetch(`/api/search?q=${encodeURIComponent(searchQ.trim())}`).then((r) => r.json())
+      const d = await api(`/api/search?q=${encodeURIComponent(searchQ.trim())}`).then((r) => r.json())
       setSearchRes(d)
     }, 300)
     return () => clearTimeout(t)
@@ -1014,6 +208,14 @@ export default function App() {
     setInboxTab('dm')
     setStatusFilter('all')
     setCur(`${platform2}:${accountId}:${sessionId}`)
+  }
+
+  const saveToken = () => {
+    setToken(tokenInput)
+    setTokenInput('')
+    setNeedAuth(false)
+    load()
+    loadAccounts()
   }
 
   const curSession = sessions.find((s) => `${s.platform}:${s.accountId}:${s.sessionId}` === cur)
@@ -1300,19 +502,14 @@ export default function App() {
                       )}
                     </div>
                     <div className="msgs-flow">
-                      {msgs.map((m) => {
-                        const self = curSession
-                          ? m.fromUsername !== curSession.username
-                          : m.fromUsername.startsWith('v2_')
-                        return (
-                          <div key={m.svrMsgId} className={self ? 'msg self' : 'msg'}>
-                            <div className="bubble">
-                              <div className="content">{m.content}</div>
-                              <div className="time mono">{fmtTime(m.ts)}</div>
-                            </div>
+                      {msgs.map((m) => (
+                        <div key={m.svrMsgId} className={m.self ? 'msg self' : 'msg'}>
+                          <div className="bubble">
+                            <div className="content">{m.content}</div>
+                            <div className="time mono">{fmtTime(m.ts)}</div>
                           </div>
-                        )
-                      })}
+                        </div>
+                      ))}
                     </div>
                     <div className="sendbox">
                       <input
@@ -1333,6 +530,28 @@ export default function App() {
             </main>
           )}
         </>
+      )}
+
+      {needAuth && (
+        <div className="modal-mask">
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-title">需要访问令牌</div>
+            <div className="acct-cookie">
+              <div className="pub-label">服务端开启了 AUTH_TOKEN，请输入后重试：</div>
+              <input
+                autoFocus
+                type="password"
+                value={tokenInput}
+                onChange={(e) => setTokenInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && saveToken()}
+                placeholder="AUTH_TOKEN"
+              />
+              <div className="pub-actions">
+                <button className="btn" onClick={saveToken} disabled={!tokenInput.trim()}>保存并重试</button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )
