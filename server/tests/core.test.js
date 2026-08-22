@@ -11,7 +11,7 @@ const path = require('node:path');
 process.env.DB_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'inbox-test-')), 'test.db');
 
 const {
-  dyParseTime, pick, isAuthError, avatarHostAllowed, accountCond, pendingCommentCond,
+  dyParseTime, pick, isAuthError, avatarHostAllowed, accountCond, pendingCommentCond, wxExtractUuid,
 } = require('../index.js');
 
 test('dyParseTime: 秒级时间戳直接透传', () => {
@@ -70,4 +70,10 @@ test('pendingCommentCond: 以 isAuthor 快照判定，不再实时比对昵称',
   assert.match(sql, /r\.rootCommentId = c\.commentId AND COALESCE\(r\.isAuthor, 0\) = 1/);
   assert.match(sql, /handled_marks/);
   assert.doesNotMatch(sql, /nickname <>/);
+});
+
+test('wxExtractUuid: 从 qrcode 路径和 uuid 赋值两种写法提取', () => {
+  assert.strictEqual(wxExtractUuid('/connect/qrcode/04124wyz3UVDFa1h"'), '04124wyz3UVDFa1h');
+  assert.strictEqual(wxExtractUuid("uuid: 'AbCdef1234'"), 'AbCdef1234');
+  assert.strictEqual(wxExtractUuid('nope'), '');
 });

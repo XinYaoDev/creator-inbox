@@ -59,8 +59,8 @@ Missing/wrong token → `401`. Static UI assets are still served without auth so
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/collect` | Trigger collection asynchronously (front-end polls `/api/status`) |
-| POST | `/api/login/start` | Start platform QR login flow |
-| GET | `/api/login/qr` | Fetch current QR code |
+| POST | `/api/login/start` | Start WeChat QR login. Returns `sessionId`, `qrDataUrl` (base64, if the server could fetch the image), `qrDirectUrl` (WeChat CDN, for the user's browser to load) |
+| GET | `/api/login/qr` | Same QR as a binary image (fallback if `qrDataUrl` was empty) |
 | GET | `/api/login/status` | Login flow status |
 | POST | `/api/login/choose` | Choose/confirm a logged-in account |
 | POST | `/api/login/cancel` | Cancel login flow |

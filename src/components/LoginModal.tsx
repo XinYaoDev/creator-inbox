@@ -2,36 +2,113 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, withToken } from '../api'
 import type { Account } from '../types'
 
-// ---------- 扫码登录弹层 ----------
+type StartResult = {
+  ok?: boolean
+  error?: string
+  sessionId?: string
+  qrDataUrl?: string
+  qrDirectUrl?: string
+}
+
+function pickQrSrc(r: StartResult) {
+  if (r.qrDataUrl) return r.qrDataUrl
+  if (r.qrDirectUrl) return r.qrDirectUrl
+  if (r.sessionId) return withToken(`/api/login/qr?sessionId=${r.sessionId}`)
+  return ''
+}
+
 export default function LoginModal({ acc, onClose, onDone }: { acc: Account; onClose: () => void; onDone: () => void }) {
   const [sessionId, setSessionId] = useState('')
-  const [status, setStatus] = useState('starting') // starting|waiting|scanned|choose|done|expired|error|manual
+  const [qrSrc, setQrSrc] = useState('')
+  const [qrFallback, setQrFallback] = useState('')
+  const [status, setStatus] = useState('starting')
   const [error, setError] = useState('')
   const [finderList, setFinderList] = useState<{ finderUsername: string; nickname: string; headImgUrl: string }[]>([])
   const [cookieText, setCookieText] = useState('')
   const sidRef = useRef('')
+  const onDoneRef = useRef(onDone)
+  const onCloseRef = useRef(onClose)
+  onDoneRef.current = onDone
+  onCloseRef.current = onClose
 
-  const start = useCallback(async () => {
-    setStatus('starting')
-    setError('')
-    const r = await api('/api/login/start', {
+  const cancelSession = (id: string) => {
+    if (!id) return
+    api('/api/login/cancel', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ accountId: acc.id }),
-    }).then((x) => x.json())
-    if (r.ok) {
-      setSessionId(r.sessionId)
-      sidRef.current = r.sessionId
-      setStatus('waiting')
-    } else {
+      body: JSON.stringify({ sessionId: id }),
+    }).catch(() => {})
+  }
+
+  const applyStart = (r: StartResult) => {
+    if (!r.ok || !r.sessionId) {
       setStatus('error')
       setError(r.error || '出码失败')
+      return
+    }
+    sidRef.current = r.sessionId
+    setSessionId(r.sessionId)
+    setQrSrc(pickQrSrc(r))
+    setQrFallback(r.qrDirectUrl && r.qrDataUrl ? r.qrDirectUrl : withToken(`/api/login/qr?sessionId=${r.sessionId}`))
+    setStatus('waiting')
+  }
+
+  const start = useCallback(async () => {
+    if (sidRef.current) {
+      cancelSession(sidRef.current)
+      sidRef.current = ''
+    }
+    setStatus('starting')
+    setError('')
+    setQrSrc('')
+    setSessionId('')
+    try {
+      const res = await api('/api/login/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accountId: acc.id }),
+      })
+      applyStart(await res.json())
+    } catch (e) {
+      setStatus('error')
+      setError(String(e))
     }
   }, [acc.id])
 
-  useEffect(() => { start() }, [start])
+  useEffect(() => {
+    let dead = false
+    ;(async () => {
+      setStatus('starting')
+      setError('')
+      setQrSrc('')
+      try {
+        const res = await api('/api/login/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accountId: acc.id }),
+        })
+        const r: StartResult = await res.json()
+        if (dead) {
+          if (r.sessionId) cancelSession(r.sessionId)
+          return
+        }
+        applyStart(r)
+      } catch (e) {
+        if (!dead) {
+          setStatus('error')
+          setError(String(e))
+        }
+      }
+    })()
+    return () => {
+      dead = true
+      if (sidRef.current) {
+        cancelSession(sidRef.current)
+        sidRef.current = ''
+      }
+    }
+  }, [acc.id])
 
-  // 轮询登录状态
   useEffect(() => {
     if (!sessionId || ['done', 'error', 'expired', 'manual'].includes(status)) return
     const t = setInterval(async () => {
@@ -41,23 +118,12 @@ export default function LoginModal({ acc, onClose, onDone }: { acc: Account; onC
       setError(r.error || '')
       if (r.finderList) setFinderList(r.finderList)
       if (r.status === 'done') {
-        onDone()
-        setTimeout(onClose, 1200)
+        onDoneRef.current()
+        setTimeout(() => onCloseRef.current(), 1200)
       }
     }, 2000)
     return () => clearInterval(t)
-  }, [sessionId, status, onClose, onDone])
-
-  // 关闭时取消会话
-  useEffect(() => () => {
-    if (sidRef.current) {
-      api('/api/login/cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: sidRef.current }),
-      })
-    }
-  }, [])
+  }, [sessionId, status])
 
   const choose = async (finderUsername: string) => {
     const r = await api('/api/login/choose', {
@@ -89,6 +155,8 @@ export default function LoginModal({ acc, onClose, onDone }: { acc: Account; onC
     } else setError(r.error || '保存失败')
   }
 
+  const showQr = status !== 'manual' && status !== 'starting' && status !== 'error' && Boolean(qrSrc)
+
   return (
     <div className="modal-mask" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -98,8 +166,15 @@ export default function LoginModal({ acc, onClose, onDone }: { acc: Account; onC
         </div>
         {status !== 'manual' && (
           <div className="modal-qr">
-            {sessionId && status !== 'starting' && status !== 'error' ? (
-              <img className="qrimg" src={withToken(`/api/login/qr?sessionId=${sessionId}`)} alt="登录二维码" />
+            {showQr ? (
+              <img
+                className="qrimg"
+                src={qrSrc}
+                alt="登录二维码"
+                onError={() => {
+                  if (qrFallback && qrFallback !== qrSrc) setQrSrc(qrFallback)
+                }}
+              />
             ) : (
               <div className="qrimg qr-loading">{status === 'starting' ? '出码中…' : '出码失败'}</div>
             )}
@@ -142,7 +217,9 @@ export default function LoginModal({ acc, onClose, onDone }: { acc: Account; onC
         )}
         <div className="modal-foot">
           {status === 'manual' ? (
-            <button className="linkbtn" onClick={() => setStatus('waiting')}>← 返回扫码登录</button>
+            <button className="linkbtn" onClick={() => { setStatus('waiting'); if (!sessionId) start() }}>
+              ← 返回扫码登录
+            </button>
           ) : (
             <button className="linkbtn" onClick={() => setStatus('manual')}>扫码不方便？手动粘贴 Cookie</button>
           )}

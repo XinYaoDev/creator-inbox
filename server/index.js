@@ -1154,6 +1154,33 @@ function jarHarvest(s, res) {
 }
 const jarHeader = (s) => [...s.jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
 
+function wxExtractUuid(html) {
+  const text = String(html || '');
+  return text.match(/\/connect\/qrcode\/([a-zA-Z0-9_-]+)/)?.[1]
+    || text.match(/\buuid\s*[:=]\s*["']([a-zA-Z0-9_-]{8,})["']/)?.[1]
+    || '';
+}
+
+function wxQrDirectUrl(uuid) {
+  return `https://open.weixin.qq.com/connect/qrcode/${uuid}`;
+}
+
+async function wxFetchQrImage(s) {
+  const headers = { 'User-Agent': UA, Referer: 'https://open.weixin.qq.com/connect/qrconnect' };
+  const cookie = jarHeader(s);
+  if (cookie) headers.Cookie = cookie;
+  const r = await fetch(wxQrDirectUrl(s.uuid), { headers, signal: AbortSignal.timeout(10000) });
+  if (!r.ok) throw new Error(`二维码拉取 HTTP ${r.status}`);
+  jarHarvest(s, r);
+  const buf = Buffer.from(await r.arrayBuffer());
+  const type = (r.headers.get('content-type') || 'image/jpeg').split(';')[0];
+  const looksHtml = type.includes('html') || buf.slice(0, 32).toString('utf8').includes('<!');
+  if (!buf.length || looksHtml) throw new Error('二维码接口返回了网页而不是图片');
+  s.qrType = type;
+  s.qrImg = buf;
+  s.qrDataUrl = `data:${type};base64,${buf.toString('base64')}`;
+}
+
 async function wxLoginCgi(s, p, body) {
   const res = await fetch(`https://channels.weixin.qq.com/cgi-bin/mmfinderassistant-bin${p}`, {
     method: 'POST',
@@ -1171,23 +1198,29 @@ async function wxLoginStart(accountId) {
     `&redirect_uri=${encodeURIComponent('https://channels.weixin.qq.com/platform/oauth-callback.html?dark=0')}` +
     `&state=undefined&login_type=jssdk&self_redirect=true&styletype=&sizetype=&bgcolor=&rst=&ts=${Date.now()}` +
     `&style=black&stylelite=1&color_scheme=light`;
-  const res = await fetch(pageUrl, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(20000) });
+  const res = await fetch(pageUrl, {
+    headers: { 'User-Agent': UA, Referer: 'https://channels.weixin.qq.com/login.html' },
+    signal: AbortSignal.timeout(20000),
+  });
   const html = await res.text();
-  const uuid = html.match(/\/connect\/qrcode\/([a-zA-Z0-9_-]+)/)?.[1];
-  if (!uuid) throw new Error('未能从 qrconnect 页面提取 uuid');
+  const uuid = wxExtractUuid(html);
+  if (!uuid) throw new Error(`未能从 qrconnect 页面提取 uuid（HTTP ${res.status}）`);
   const s = {
     id: crypto.randomUUID(), accountId, uuid,
     status: 'waiting', // waiting|scanned|confirmed|choose|done|expired|cancelled|error
-    jar: new Map(), finderList: null, error: '', qrImg: null, qrType: 'image/png', createdAt: Date.now(),
+    jar: new Map(), finderList: null, error: '', qrImg: null, qrType: 'image/jpeg', qrDataUrl: '',
+    createdAt: Date.now(),
   };
+  jarHarvest(s, res);
   loginSessions.set(s.id, s);
+  try { await wxFetchQrImage(s); } catch { /* 前端可改走微信原图地址 */ }
   wxLoginPoll(s).catch((e) => {
     if (!['done', 'cancelled'].includes(s.status)) {
       s.status = 'error';
       s.error = String(e && e.message || e);
     }
   });
-  return { sessionId: s.id };
+  return { sessionId: s.id, qrDataUrl: s.qrDataUrl || '', qrDirectUrl: wxQrDirectUrl(uuid) };
 }
 
 async function wxLoginPoll(s) {
@@ -1197,10 +1230,10 @@ async function wxLoginPoll(s) {
     let text;
     try {
       const url = `https://long.open.weixin.qq.com/connect/l/qrconnect?uuid=${s.uuid}${last ? `&last=${last}` : ''}`;
-      const res = await fetch(url, {
-        headers: { 'User-Agent': UA, Referer: 'https://open.weixin.qq.com/' },
-        signal: AbortSignal.timeout(45000),
-      });
+      const headers = { 'User-Agent': UA, Referer: 'https://open.weixin.qq.com/connect/qrconnect' };
+      const cookie = jarHeader(s);
+      if (cookie) headers.Cookie = cookie;
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(45000) });
       text = await res.text();
     } catch { continue; } // 网络抖动直接续轮
     const errcode = text.match(/wx_errcode=(\d+)/)?.[1];
@@ -1503,15 +1536,7 @@ const routes = {
     const s = loginSessions.get(String(u.searchParams.get('sessionId') || ''));
     if (!s) return sendJson(res, 404, { error: '登录会话不存在或已过期' });
     try {
-      if (!s.qrImg) {
-        const r = await fetch(`https://open.weixin.qq.com/connect/qrcode/${s.uuid}`, {
-          headers: { 'User-Agent': UA, Referer: 'https://open.weixin.qq.com/' },
-          signal: AbortSignal.timeout(10000),
-        });
-        if (!r.ok) throw new Error(`二维码拉取 HTTP ${r.status}`);
-        s.qrType = (r.headers.get('content-type') || 'image/png').split(';')[0];
-        s.qrImg = Buffer.from(await r.arrayBuffer());
-      }
+      if (!s.qrImg) await wxFetchQrImage(s);
       res.writeHead(200, { 'Content-Type': s.qrType, 'Cache-Control': 'no-store' });
       res.end(s.qrImg);
     } catch (e) {
@@ -1800,5 +1825,5 @@ if (require.main === module) {
 
 // 纯逻辑导出供单元测试（require 本文件不会启动服务/采集）
 module.exports = {
-  dyParseTime, pick, isAuthError, avatarHostAllowed, accountCond, pendingCommentCond,
+  dyParseTime, pick, isAuthError, avatarHostAllowed, accountCond, pendingCommentCond, wxExtractUuid,
 };
