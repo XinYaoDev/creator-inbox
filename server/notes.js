@@ -177,14 +177,7 @@ const NOTE_ENV_KEYS = new Set([
   'HERMES_IMAGE_URL', 'HERMES_IMAGE_TOKEN',
 ]);
 
-function parseLlmJson(text) {
-  const raw = String(text || '').trim();
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const s = (fenced ? fenced[1] : raw).trim();
-  const start = s.search(/[\[{]/);
-  if (start < 0) throw new Error('模型没有返回 JSON');
-  return JSON.parse(s.slice(start));
-}
+const { parseLlmJson, llmConfig, isKimiK3 } = require('./llm.js');
 
 function fallbackDraft(topic, material) {
   const fact = String(material || '').trim().split(/[。\n！？]/).map((s) => s.trim()).find(Boolean) || '';
@@ -225,51 +218,6 @@ function buildImagePrompt(want) {
   ].join(' ');
 }
 
-function isKimiK3(model) {
-  return /^(k3|kimi-k3)\b/i.test(String(model || ''));
-}
-
-function llmConfig() {
-  const baseOverride = (process.env.NOTE_LLM_BASE_URL || '').replace(/\/$/, '');
-  const modelOverride = process.env.NOTE_LLM_MODEL || '';
-  if (process.env.NOTE_LLM_KEY) {
-    return {
-      key: process.env.NOTE_LLM_KEY,
-      base: baseOverride || 'https://api.kimi.com/coding/v1',
-      model: modelOverride || 'k3',
-    };
-  }
-  if (process.env.KIMI_API_KEY) {
-    return {
-      key: process.env.KIMI_API_KEY,
-      base: baseOverride || 'https://api.kimi.com/coding/v1',
-      model: modelOverride || 'k3',
-    };
-  }
-  if (process.env.MOONSHOT_API_KEY) {
-    return {
-      key: process.env.MOONSHOT_API_KEY,
-      base: baseOverride || 'https://api.moonshot.cn/v1',
-      model: modelOverride || 'kimi-k3',
-    };
-  }
-  if (process.env.DEEPSEEK_API_KEY) {
-    return {
-      key: process.env.DEEPSEEK_API_KEY,
-      base: baseOverride || 'https://api.deepseek.com/v1',
-      model: modelOverride || 'deepseek-chat',
-    };
-  }
-  if (process.env.OPENAI_API_KEY) {
-    return {
-      key: process.env.OPENAI_API_KEY,
-      base: baseOverride || 'https://api.openai.com/v1',
-      model: modelOverride || 'gpt-4o-mini',
-    };
-  }
-  return { key: '', base: '', model: '' };
-}
-
 async function chatJson(system, user) {
   const { key, base, model } = llmConfig();
   if (!key) return null;
@@ -304,17 +252,31 @@ function imageProvider() {
   return 'pollinations';
 }
 
-async function generateViaHermes(prompt, dest) {
+function imageType(buf) {
+  if (!buf || buf.length < 12) return 'application/octet-stream';
+  if (buf[0] === 0x89 && buf[1] === 0x50) return 'image/png';
+  if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg';
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[8] === 0x57) return 'image/webp';
+  return 'image/jpeg';
+}
+
+function noteFile(noteDir, id) {
+  return path.join(noteDir, `${id}.jpg`);
+}
+
+async function generateViaHermes(prompt, dest, refBuf) {
   const base = (process.env.HERMES_IMAGE_URL || '').replace(/\/$/, '');
   const token = process.env.HERMES_IMAGE_TOKEN || '';
   if (!base) throw new Error('未配置 HERMES_IMAGE_URL（本机 Hermes 出图桥）');
   if (!token) throw new Error('未配置 HERMES_IMAGE_TOKEN');
+  const payload = { prompt, aspect_ratio: 'portrait' };
+  if (refBuf && refBuf.length) payload.image = Buffer.from(refBuf).toString('base64');
   let last = 'Hermes 出图失败';
   for (let attempt = 0; attempt < 2; attempt++) {
     const r = await fetch(`${base}/generate`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, aspect_ratio: 'portrait' }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(240000),
     });
     if (r.ok) {
@@ -341,12 +303,22 @@ async function fetchToFile(url, dest, headers = {}) {
   fs.writeFileSync(dest, buf);
 }
 
-async function generateImageBuffer(prompt, noteDir) {
+function readRef(noteDir, refId) {
+  const id = String(refId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!id) return null;
+  const file = noteFile(noteDir, id);
+  if (!fs.existsSync(file)) return null;
+  return fs.readFileSync(file);
+}
+
+async function generateImageBuffer(prompt, noteDir, refId) {
   const id = crypto.randomUUID().slice(0, 12);
-  const dest = path.join(noteDir, `${id}.jpg`);
+  const dest = noteFile(noteDir, id);
+  const refBuf = readRef(noteDir, refId);
   const p = imageProvider();
+  if (refBuf && p !== 'hermes') throw new Error('图生图目前只走本机 Hermes');
   if (p === 'hermes') {
-    await generateViaHermes(prompt, dest);
+    await generateViaHermes(prompt, dest, refBuf);
   } else if (p === 'fal') {
     const key = process.env.FAL_KEY || process.env.NOTE_IMAGE_KEY;
     if (!key) throw new Error('未配置 FAL_KEY');
@@ -429,7 +401,7 @@ function normalizeSlots(raw) {
   });
 }
 
-module.exports = function createNotes({ sendJson, readBody, noteDir, log = console.log, assets = null }) {
+module.exports = function createNotes({ sendJson, readBody, noteDir, log = console.log, assets = null, readLibraryImage = null }) {
   loadDotEnv(path.join(__dirname, '..', '.env'));
   loadDotEnv(path.join(noteDir, '..', '.env'));
   loadDotEnv(path.join(os.homedir(), '.hermes', '.env'), NOTE_ENV_KEYS);
@@ -450,10 +422,47 @@ module.exports = function createNotes({ sendJson, readBody, noteDir, log = conso
 
     if (method === 'GET' && p === '/api/notes/file') {
       const id = String(u.searchParams.get('id') || '').replace(/[^a-zA-Z0-9_-]/g, '');
-      const file = path.join(noteDir, `${id}.jpg`);
+      const file = noteFile(noteDir, id);
       if (!id || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
-      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=86400' });
-      return res.end(fs.readFileSync(file));
+      const buf = fs.readFileSync(file);
+      res.writeHead(200, { 'Content-Type': imageType(buf), 'Cache-Control': 'public, max-age=86400' });
+      return res.end(buf);
+    }
+
+    if (method === 'POST' && p === '/api/notes/upload') {
+      const chunks = [];
+      let size = 0;
+      try {
+        for await (const c of req) {
+          size += c.length;
+          if (size > 8 * 1024 * 1024) return sendJson(res, 400, { ok: false, error: '图太大，换一张小点的' });
+          chunks.push(c);
+        }
+      } catch (e) {
+        return sendJson(res, 400, { ok: false, error: String(e.message || e) });
+      }
+      const buf = Buffer.concat(chunks);
+      if (buf.length < 80 || imageType(buf) === 'application/octet-stream') {
+        return sendJson(res, 400, { ok: false, error: '不像一张图' });
+      }
+      const id = crypto.randomUUID().slice(0, 12);
+      fs.writeFileSync(noteFile(noteDir, id), buf);
+      return sendJson(res, 200, { ok: true, imageId: id });
+    }
+
+    if (method === 'POST' && p === '/api/notes/from-library') {
+      const body = await readBody(req);
+      const libId = String(body.id || '').trim();
+      if (!libId) return sendJson(res, 400, { ok: false, error: '缺素材 id' });
+      if (!readLibraryImage) return sendJson(res, 400, { ok: false, error: '素材库还没接上' });
+      let buf;
+      try { buf = readLibraryImage(libId); } catch (e) {
+        return sendJson(res, 400, { ok: false, error: String(e.message || e) });
+      }
+      if (!buf || !buf.length) return sendJson(res, 404, { ok: false, error: '库里没有这张图' });
+      const id = crypto.randomUUID().slice(0, 12);
+      fs.writeFileSync(noteFile(noteDir, id), buf);
+      return sendJson(res, 200, { ok: true, imageId: id });
     }
 
     if (method === 'POST' && p === '/api/notes/draft') {
@@ -561,7 +570,7 @@ module.exports = function createNotes({ sendJson, readBody, noteDir, log = conso
       try {
         const results = await mapPool(slots.slice(0, 9), 3, async (s) => {
           const prompt = String(s.prompt || '').trim() || buildImagePrompt(s.want);
-          const imageId = await generateImageBuffer(prompt, noteDir);
+          const imageId = await generateImageBuffer(prompt, noteDir, s.imageId || s.photoId);
           return { id: s.id, imageId };
         });
         return sendJson(res, 200, { ok: true, results, provider: imageProvider() });
@@ -572,13 +581,14 @@ module.exports = function createNotes({ sendJson, readBody, noteDir, log = conso
 
     if (method === 'POST' && p === '/api/notes/generate-one') {
       const body = await readBody(req);
-      const prompt = String(body.prompt || '').trim();
+      const refId = String(body.imageId || body.photoId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+      const prompt = String(body.prompt || '').trim() || buildImagePrompt(body.want || (refId ? 'same scene, keep the people and place, candid photo' : ''));
       const want = Math.min(4, Math.max(1, Number(body.n) || 3));
       const n = imageProvider() === 'hermes' ? 1 : want;
       if (!prompt) return sendJson(res, 400, { ok: false, error: '这张还没有提示词' });
       try {
         const ids = [];
-        for (let i = 0; i < n; i++) ids.push(await generateImageBuffer(prompt, noteDir));
+        for (let i = 0; i < n; i++) ids.push(await generateImageBuffer(prompt, noteDir, refId));
         return sendJson(res, 200, { ok: true, imageIds: ids, provider: imageProvider() });
       } catch (e) {
         return sendJson(res, 200, { ok: false, error: String(e.message || e) });

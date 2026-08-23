@@ -71,11 +71,14 @@ Library routes are delegated to `server/library.js` (prefix `/api/library/`).
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/library/files` | Media files with facet tags, query by facets/type |
+| GET | `/api/library/assets` | List assets (`type`, `source` nas/upload/ai, `q` path/tags/caption, `tag`, `sort`, `limit`) |
+| GET | `/api/library/suggest` | `q` 人话检索图片，按 caption/关键词/专辑打分，实拍优先 |
+| POST | `/api/library/caption-backfill` | 给未描述的图片补 Kimi 视觉描述 |
+| GET | `/api/library/caption-status` | `{running, done, total, errors}` |
+| POST | `/api/library/save-note-image` | `{imageId, caption?, keywords?}` 把笔记生成图存进库 `source=ai` |
 | POST | `/api/library/scan` | Scan configured NAS/media directory |
-| POST | `/api/upload/file` | Upload a media file (multipart) |
-| POST | `/api/upload/draft` | Upload/create a publishing draft |
-| DELETE | `/api/library/files/:id` | Remove file (varies) |
+| GET | `/api/library/scan/status` | Scan progress |
+| POST | `/api/library/upload` | Raw image/video body + `?filename=` |
 
 > Detailed library API is under active development; check `server/library.js` for the current surface.
 
@@ -90,8 +93,10 @@ One note at a time: material → copy (style + lint) → storyboard → generate
 | POST | `/api/notes/lint` | `{title, body, material, style, rewrite?}` → `{lint, title, body}`. `rewrite:true` asks the model to fix fails. |
 | POST | `/api/notes/storyboard` | `{topic, body}` → `{slots: [{id, role, want, prompt}]}` |
 | POST | `/api/notes/generate` | `{slots}` → `{results: [{id, imageId}]}` |
-| POST | `/api/notes/generate-one` | `{prompt, n}` → `{imageIds}` variants for one slot |
-| GET | `/api/notes/file?id=` | JPEG for a generated image |
+| POST | `/api/notes/generate-one` | `{prompt, want?, imageId?, n}` → `{imageIds}`. `imageId` is a previously uploaded/generated file used as img2img reference (Hermes only) |
+| POST | `/api/notes/upload` | Raw image body (jpeg/png/webp, ≤8MB) → `{imageId}` stored under `data/notes/` |
+| POST | `/api/notes/from-library` | `{id}` library image asset → copy into `data/notes/`, `{imageId}` |
+| GET | `/api/notes/file?id=` | Stored image (generated or uploaded) |
 
 Drafting records today's material into `data/assets/materials.jsonl` and, when enough cases exist, uses them as few-shot examples instead of the built-in ones.
 

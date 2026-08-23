@@ -1630,6 +1630,7 @@ const routes = {
 };
 
 // ---------- 素材库 ----------
+const NOTE_DIR = path.join(DATA_DIR, 'notes');
 const libraryHandle = createLibrary({
   db,
   sendJson,
@@ -1637,6 +1638,13 @@ const libraryHandle = createLibrary({
   mediaRoot: process.env.MEDIA_ROOT || '',
   thumbDir: process.env.THUMB_DIR || path.join(DATA_DIR, 'thumbs'),
   uploadDir: UPLOAD_DIR,
+  readNoteImage(id) {
+    const safe = String(id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!safe) return null;
+    const file = path.join(NOTE_DIR, `${safe}.jpg`);
+    if (!fs.existsSync(file)) return null;
+    return fs.readFileSync(file);
+  },
 });
 
 const assetsApi = createAssets({
@@ -1650,8 +1658,17 @@ const assetsHandle = assetsApi.handle;
 const notesHandle = createNotes({
   sendJson,
   readBody,
-  noteDir: path.join(DATA_DIR, 'notes'),
+  noteDir: NOTE_DIR,
   assets: assetsApi,
+  readLibraryImage(id) {
+    const safe = String(id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!safe) return null;
+    const row = db.prepare('SELECT file_path, file_type FROM media_assets WHERE id = ?').get(safe);
+    if (!row || row.file_type !== 'image') return null;
+    const resolved = path.resolve(String(row.file_path || ''));
+    if (!resolved || !fs.existsSync(resolved)) return null;
+    return fs.readFileSync(resolved);
+  },
 });
 
 const updateHandle = createUpdate({

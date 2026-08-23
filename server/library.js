@@ -28,7 +28,12 @@ const MIME = {
   '.webp': 'image/webp', '.gif': 'image/gif',
 };
 
-module.exports = function createLibrary({ db, sendJson, readBody, mediaRoot, thumbDir, uploadDir, log = console.log }) {
+const { createCaptioner, scoreAsset } = require('./caption.js');
+
+module.exports = function createLibrary({
+  db, sendJson, readBody, mediaRoot, thumbDir, uploadDir,
+  captioner = null, readNoteImage = null, log = console.log,
+}) {
   fs.mkdirSync(thumbDir, { recursive: true });
   if (uploadDir) fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -71,6 +76,14 @@ CREATE TABLE IF NOT EXISTS asset_annotations(
 CREATE INDEX IF NOT EXISTS idx_assets_shoot ON media_assets(shoot_time DESC);
 CREATE INDEX IF NOT EXISTS idx_ann_asset ON asset_annotations(asset_id);
 `);
+  for (const col of [
+    'ALTER TABLE media_assets ADD COLUMN ai_caption TEXT DEFAULT \'\'',
+    'ALTER TABLE media_assets ADD COLUMN ai_keywords TEXT DEFAULT \'\'',
+    'ALTER TABLE media_assets ADD COLUMN captioned_at INTEGER DEFAULT 0',
+  ]) {
+    try { db.exec(col); } catch { /* already exists */ }
+  }
+  const cap = captioner || createCaptioner({ db, log });
   // 预置分面标签（幂等）
   const insTax = db.prepare('INSERT OR IGNORE INTO taxonomy_nodes(facet,label,createdAt) VALUES(?,?,?)');
   for (const [facet, labels] of Object.entries(PRESET_TAGS)) {
@@ -192,6 +205,7 @@ CREATE INDEX IF NOT EXISTS idx_ann_asset ON asset_annotations(asset_id);
       .run(rec.id, rec.source, rec.file_path, rec.file_type, rec.file_size, rec.duration, rec.width,
         rec.height, rec.fps, rec.orientation, rec.shoot_time, rec.original_tags, rec.thumb_path,
         rec.status, now(), rec.updatedAt);
+    if (!video) cap.enqueue(rec.id);
   }
 
   async function startScan(trigger) {
@@ -248,8 +262,12 @@ CREATE INDEX IF NOT EXISTS idx_ann_asset ON asset_annotations(asset_id);
     const q = (u.searchParams.get('q') || '').trim();
     const tags = u.searchParams.getAll('tag');
     if (type === 'video' || type === 'image') { conds.push('m.file_type = ?'); args.push(type); }
-    if (source === 'nas' || source === 'upload') { conds.push('m.source = ?'); args.push(source); }
-    if (q) { conds.push('(m.file_path LIKE ? OR m.original_tags LIKE ?)'); args.push(`%${q}%`, `%${q}%`); }
+    if (source === 'nas' || source === 'upload' || source === 'ai') { conds.push('m.source = ?'); args.push(source); }
+    if (u.searchParams.get('captioned') === '1') conds.push("m.ai_caption IS NOT NULL AND m.ai_caption != ''");
+    if (q) {
+      conds.push('(m.file_path LIKE ? OR m.original_tags LIKE ? OR m.ai_caption LIKE ? OR m.ai_keywords LIKE ?)');
+      args.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    }
     for (const t of tags) {
       const idx = t.indexOf(':');
       if (idx > 0) {
@@ -271,6 +289,63 @@ CREATE INDEX IF NOT EXISTS idx_ann_asset ON asset_annotations(asset_id);
       .all(...args, limit, offset)
       .map((r) => ({ ...r, tags: r.tagStr ? r.tagStr.split('|') : [] }));
     return { list, total };
+  }
+
+  function suggest(u) {
+    const q = (u.searchParams.get('q') || '').trim();
+    const limit = Math.min(Math.max(Number(u.searchParams.get('limit')) || 8, 1), 24);
+    if (!q) return { list: [], total: 0 };
+    const rows = db.prepare(`SELECT id, thumb_path, file_path, ai_caption, ai_keywords, original_tags, source, shoot_time
+      FROM media_assets WHERE file_type='image' AND status='indexed'`).all();
+    const scored = [];
+    for (const r of rows) {
+      const score = scoreAsset(r, q);
+      if (score > 0) scored.push({ ...r, score });
+    }
+    scored.sort((a, b) => b.score - a.score || (b.shoot_time || 0) - (a.shoot_time || 0));
+    return {
+      list: scored.slice(0, limit).map((r) => ({
+        id: r.id,
+        thumb_path: r.thumb_path,
+        file_path: r.file_path,
+        ai_caption: r.ai_caption,
+        source: r.source,
+        score: r.score,
+      })),
+      total: scored.length,
+    };
+  }
+
+  function saveNoteImage(body) {
+    const imageId = String(body.imageId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!imageId) return { ok: false, error: '缺 imageId' };
+    if (!readNoteImage) return { ok: false, error: '笔记图还没接上' };
+    const dest = path.join(uploadDir, `ai_${imageId}.jpg`);
+    const existing = db.prepare('SELECT id, source FROM media_assets WHERE file_path=?').get(dest);
+    if (existing) return { ok: true, asset: existing, existed: true };
+    const buf = readNoteImage(imageId);
+    if (!buf || !buf.length) return { ok: false, error: '笔记里没有这张图' };
+    fs.writeFileSync(dest, buf);
+    const rec = {
+      id: assetId(dest),
+      source: 'ai',
+      file_path: dest,
+      file_type: 'image',
+      file_size: buf.length,
+      shoot_time: now(),
+      ai_caption: String(body.caption || '').trim(),
+      ai_keywords: Array.isArray(body.keywords) ? body.keywords.map(String).join(',') : String(body.keywords || ''),
+    };
+    const thumbPath = path.join(thumbDir, `${rec.id}.jpg`);
+    return genThumb(dest, thumbPath, false).then((okThumb) => {
+      db.prepare(`INSERT INTO media_assets(id,source,file_path,file_type,file_size,duration,width,height,fps,orientation,shoot_time,original_tags,thumb_path,status,createdAt,updatedAt,ai_caption,ai_keywords,captioned_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(rec.id, rec.source, rec.file_path, rec.file_type, rec.file_size, 0, 0, 0, 0, '',
+          rec.shoot_time, '', okThumb ? thumbPath : '', 'indexed', now(), now(),
+          rec.ai_caption, rec.ai_keywords, rec.ai_caption ? now() : 0);
+      if (!rec.ai_caption) cap.enqueue(rec.id);
+      return { ok: true, asset: { id: rec.id, source: 'ai' } };
+    });
   }
 
   function assetDetail(id) {
@@ -376,6 +451,7 @@ CREATE INDEX IF NOT EXISTS idx_ann_asset ON asset_annotations(asset_id);
         .run(rec.id, rec.source, rec.file_path, rec.file_type, rec.file_size, rec.duration, rec.width,
           rec.height, rec.fps, rec.orientation, rec.shoot_time, rec.original_tags, rec.thumb_path,
           'indexed', now(), now());
+      if (!video) cap.enqueue(rec.id);
       return sendJson(res, 200, { ok: true, asset: { id: rec.id, file_type: rec.file_type, file_size: size } });
     } catch (e) {
       try { fs.unlinkSync(dest); } catch { /* ignore */ }
@@ -396,6 +472,19 @@ CREATE INDEX IF NOT EXISTS idx_ann_asset ON asset_annotations(asset_id);
     if (method === 'GET' && p === '/api/library/scan/status') return sendJson(res, 200, scanStatus());
 
     if (method === 'GET' && p === '/api/library/assets') return sendJson(res, 200, listAssets(u));
+    if (method === 'GET' && p === '/api/library/suggest') return sendJson(res, 200, suggest(u));
+    if (method === 'POST' && p === '/api/library/caption-backfill') return sendJson(res, 200, cap.startBackfill());
+    if (method === 'POST' && p === '/api/library/caption-stop') return sendJson(res, 200, cap.stopBackfill());
+    if (method === 'GET' && p === '/api/library/caption-status') return sendJson(res, 200, cap.status());
+    if (method === 'POST' && p === '/api/library/save-note-image') {
+      const body = await readBody(req);
+      try {
+        const r = await saveNoteImage(body);
+        return sendJson(res, r.ok ? 200 : 400, r);
+      } catch (e) {
+        return sendJson(res, 500, { ok: false, error: String(e && e.message || e) });
+      }
+    }
 
     if ((m = p.match(/^\/api\/library\/assets\/([^/]+)$/))) {
       if (method === 'GET') {

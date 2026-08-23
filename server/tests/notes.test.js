@@ -165,3 +165,46 @@ test('generateImageBuffer: hermes 空返回后重试一次', async () => {
     }
   }
 });
+
+test('generateImageBuffer: 有底图时发给桥 image 字段', async () => {
+  const http = require('node:http');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const jpeg = Buffer.alloc(1200, 0xff);
+  let sawImage = false;
+  const srv = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw || '{}');
+      sawImage = Boolean(body.image) && body.image.length > 10;
+      res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+      res.end(jpeg);
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const { port } = srv.address();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-ref-'));
+  const keep = {
+    NOTE_IMAGE_PROVIDER: process.env.NOTE_IMAGE_PROVIDER,
+    HERMES_IMAGE_URL: process.env.HERMES_IMAGE_URL,
+    HERMES_IMAGE_TOKEN: process.env.HERMES_IMAGE_TOKEN,
+  };
+  try {
+    process.env.NOTE_IMAGE_PROVIDER = 'hermes';
+    process.env.HERMES_IMAGE_URL = `http://127.0.0.1:${port}`;
+    process.env.HERMES_IMAGE_TOKEN = 'test-token';
+    fs.writeFileSync(path.join(dir, 'ref1.jpg'), Buffer.alloc(200, 0x11));
+    const id = await notes.generateImageBuffer('keep the courtyard', dir, 'ref1');
+    assert.ok(fs.existsSync(path.join(dir, `${id}.jpg`)));
+    assert.equal(sawImage, true);
+  } finally {
+    srv.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(keep)) {
+      if (v == null) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});

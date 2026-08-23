@@ -6,9 +6,11 @@ from ~/.hermes/image-bridge.env (chmod 600). ChatGPT OAuth stays in Hermes.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -22,6 +24,8 @@ HOST = os.environ.get("HERMES_IMAGE_HOST") or "0.0.0.0"
 PORT = int(os.environ.get("HERMES_IMAGE_PORT") or "8879")
 MAX_PROMPT = 4000
 EMPTY_RETRY = 1
+MAX_GENERATE_BODY = 12_000_000
+MAX_XHS_BODY = 64_000
 WEBBRIDGE = os.environ.get("WEBBRIDGE_URL") or "http://127.0.0.1:10086/command"
 XHS_SESSION = "xhs-asset-learn"
 XHS_EXTRACT = r"""
@@ -96,10 +100,13 @@ def setup_hermes() -> None:
     sys.path.insert(0, str(HERMES_AGENT))
 
 
-def generate_once(prompt: str, aspect: str) -> dict:
+def generate_once(prompt: str, aspect: str, image_path: str | None = None) -> dict:
     from tools.image_generation_tool import _handle_image_generate
 
-    raw = _handle_image_generate({"prompt": prompt, "aspect_ratio": aspect})
+    args: dict = {"prompt": prompt, "aspect_ratio": aspect}
+    if image_path:
+        args["image_url"] = image_path
+    raw = _handle_image_generate(args)
     if isinstance(raw, str):
         try:
             return json.loads(raw)
@@ -110,11 +117,28 @@ def generate_once(prompt: str, aspect: str) -> dict:
     return {"success": False, "error": "unexpected image_generate result"}
 
 
-def generate(prompt: str, aspect: str) -> bytes:
+def generate(prompt: str, aspect: str, image_bytes: bytes | None = None) -> bytes:
+    tmp = None
+    if image_bytes:
+        fd, name = tempfile.mkstemp(prefix="hermes-ref-", suffix=".jpg")
+        os.close(fd)
+        tmp = Path(name)
+        tmp.write_bytes(image_bytes)
     last = "Hermes 出图失败"
+    try:
+        return _generate_loop(prompt, aspect, str(tmp) if tmp else None, last)
+    finally:
+        if tmp:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _generate_loop(prompt: str, aspect: str, image_path: str | None, last: str) -> bytes:
     for attempt in range(1 + EMPTY_RETRY):
         t0 = time.time()
-        result = generate_once(prompt, aspect)
+        result = generate_once(prompt, aspect, image_path)
         dt = time.time() - t0
         if result.get("success") and result.get("image"):
             path = Path(str(result["image"]))
@@ -238,7 +262,8 @@ class Handler(BaseHTTPRequestHandler):
         if not authorized(self):
             return self._json(401, {"ok": False, "error": "unauthorized"})
         n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0 or n > 64_000:
+        limit = MAX_XHS_BODY if path == "/xhs-note" else MAX_GENERATE_BODY
+        if n <= 0 or n > limit:
             return self._json(400, {"ok": False, "error": "bad body"})
         try:
             body = json.loads(self.rfile.read(n).decode("utf-8"))
@@ -260,8 +285,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "error": "prompt required"})
         if len(prompt) > MAX_PROMPT:
             return self._json(400, {"ok": False, "error": "prompt too long"})
+        raw_image = str((body or {}).get("image") or "").strip()
+        image_bytes = None
+        if raw_image:
+            if raw_image.startswith("data:") and "," in raw_image:
+                raw_image = raw_image.split(",", 1)[1]
+            try:
+                image_bytes = base64.b64decode(raw_image, validate=False)
+            except Exception:
+                return self._json(400, {"ok": False, "error": "底图读不出来"})
+            if len(image_bytes) < 80:
+                return self._json(400, {"ok": False, "error": "底图太小"})
         try:
-            data = generate(prompt, aspect)
+            data = generate(prompt, aspect, image_bytes)
         except Exception as e:
             return self._json(502, {"ok": False, "error": str(e)})
         ctype = "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"

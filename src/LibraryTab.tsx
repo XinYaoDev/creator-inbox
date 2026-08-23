@@ -5,7 +5,7 @@ type FacetTag = { id: number; label: string; count: number }
 type FacetNode = { name: string; tags: FacetTag[] }
 type Asset = {
   id: string
-  source: 'nas' | 'upload'
+  source: 'nas' | 'upload' | 'ai'
   file_type: 'video' | 'image'
   file_size: number
   duration: number
@@ -19,6 +19,7 @@ type Asset = {
   status: string
   file_path: string
   tags: string[]
+  ai_caption?: string
 }
 type PickedTag = { id: number; facet: string; label: string }
 type AssetDetail = Omit<Asset, 'tags'> & { tags: PickedTag[] }
@@ -46,10 +47,12 @@ export default function LibraryTab({ onBack }: { onBack?: () => void }) {
   const [facets, setFacets] = useState<FacetNode[]>([])
   const [cur, setCur] = useState<AssetDetail | null>(null)
   const [scan, setScan] = useState<ScanStatus | null>(null)
+  const [cap, setCap] = useState<ScanStatus | null>(null)
   const [type, setType] = useState('all')
   const [source, setSource] = useState('all')
   const [sort, setSort] = useState('time')
   const [q, setQ] = useState('')
+  const [captionedOnly, setCaptionedOnly] = useState(false)
   const [selTags, setSelTags] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [toast, setToast] = useState('')
@@ -61,6 +64,7 @@ export default function LibraryTab({ onBack }: { onBack?: () => void }) {
     if (type !== 'all') params.set('type', type)
     if (source !== 'all') params.set('source', source)
     if (q.trim()) params.set('q', q.trim())
+    if (captionedOnly) params.set('captioned', '1')
     for (const t of selTags) params.append('tag', t)
     const d = await api(`/api/library/assets?${params}`).then((r) => r.json())
     setAssets(d.list || [])
@@ -76,7 +80,7 @@ export default function LibraryTab({ onBack }: { onBack?: () => void }) {
   useEffect(() => {
     const t = setTimeout(load, q ? 300 : 0)
     return () => clearTimeout(t)
-  }, [type, source, sort, q, selTags])
+  }, [type, source, sort, q, selTags, captionedOnly])
 
   useEffect(() => {
     loadTax()
@@ -100,6 +104,20 @@ export default function LibraryTab({ onBack }: { onBack?: () => void }) {
       if (t) clearInterval(t)
     }
   }, [scan?.running])
+
+  useEffect(() => {
+    let t: ReturnType<typeof setInterval> | null = null
+    const poll = async () => {
+      const s = await api('/api/library/caption-status').then((r) => r.json())
+      setCap(s)
+      if (!s.running && t) clearInterval(t)
+    }
+    poll()
+    if (cap?.running) t = setInterval(poll, 2000)
+    return () => {
+      if (t) clearInterval(t)
+    }
+  }, [cap?.running])
 
   const startScan = async () => {
     const r = await api('/api/library/scan', { method: 'POST' }).then((x) => x.json())
@@ -196,6 +214,7 @@ export default function LibraryTab({ onBack }: { onBack?: () => void }) {
           <option value="all">全部来源</option>
           <option value="nas">NAS</option>
           <option value="upload">上传</option>
+          <option value="ai">AI 生成</option>
         </select>
         <select value={sort} onChange={(e) => setSort(e.target.value)}>
           <option value="time">按拍摄时间</option>
@@ -204,6 +223,30 @@ export default function LibraryTab({ onBack }: { onBack?: () => void }) {
         </select>
         <button className="btn" onClick={() => fileRef.current?.click()} disabled={busy}>
           {busy ? '上传中…' : '+ 上传'}
+        </button>
+        <button
+          className={captionedOnly ? 'btn' : 'linkbtn'}
+          onClick={() => setCaptionedOnly((v) => !v)}
+        >
+          {captionedOnly ? '只看已描述' : '已描述'}
+        </button>
+        <button
+          className="btn"
+          onClick={async () => {
+            if (cap?.running) {
+              await api('/api/library/caption-stop', { method: 'POST' })
+              setToast('已停下，写好的还在')
+              setCap((s) => (s ? { ...s, running: false } : s))
+              setTimeout(() => setToast(''), 3000)
+              return
+            }
+            const r = await api('/api/library/caption-backfill', { method: 'POST' }).then((x) => x.json())
+            setToast(r.queued ? `开始补描述 ${r.queued} 张` : (r.running ? '补描述进行中' : '没有要补的'))
+            setCap((s) => ({ ...(s || { errors: [], startedAt: 0, finishedAt: 0 }), running: true, total: r.queued || 0, done: 0 }))
+            setTimeout(() => setToast(''), 4000)
+          }}
+        >
+          {cap?.running ? `停下 ${cap.done}/${cap.total}` : '补描述'}
         </button>
         <input
           ref={fileRef}
@@ -237,6 +280,19 @@ export default function LibraryTab({ onBack }: { onBack?: () => void }) {
         </div>
       )}
 
+      {cap?.running && (
+        <div className="lib-scanbar">
+          <div
+            className="lib-scanfill"
+            style={{ width: `${cap.total ? Math.round((cap.done / cap.total) * 100) : 0}%` }}
+          />
+          <span>
+            补描述 {cap.done}/{cap.total}
+            {cap.errors.length ? ` · 失败 ${cap.errors.length}` : ''}
+          </span>
+        </div>
+      )}
+
       {scan?.running && (
         <div className="lib-scanbar">
           <div
@@ -264,7 +320,7 @@ export default function LibraryTab({ onBack }: { onBack?: () => void }) {
                 <div className="lthumb lthumb-fallback">{a.file_type === 'video' ? '🎬' : '🖼'}</div>
               )}
               <div className="lcard-meta">
-                <div className="lcard-name">{a.file_path.split('/').pop()}</div>
+                <div className="lcard-name">{a.ai_caption || a.file_path.split('/').pop()}</div>
                 <div className="lcard-sub mono">
                   {a.file_type === 'video' ? `${fmtDur(a.duration)} · ${a.orientation}` : '图片'}
                   {a.source === 'upload' ? ' · 上传' : ''}
@@ -321,6 +377,12 @@ export default function LibraryTab({ onBack }: { onBack?: () => void }) {
                 <span>拍摄</span>
                 <b>{fmtFull(cur.shoot_time)}</b>
               </div>
+              {cur.ai_caption && (
+                <div className="ld-row">
+                  <span>描述</span>
+                  <b>{cur.ai_caption}</b>
+                </div>
+              )}
               <div className="ld-row">
                 <span>路径</span>
                 <b className="ld-path">{cur.file_path}</b>
