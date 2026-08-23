@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import { fmtTime } from '../utils'
+import { formatWechatEmoji } from '../wechatEmoji'
 import Avatar from './Avatar'
 import type { CommentItem } from '../types'
 
@@ -76,10 +77,13 @@ export default function CommentRow({
       <Avatar url={c.headUrl} name={c.nickname} />
       <div className="row-main">
         <div className="row-head">
-          <span className="nick">{c.nickname || '匿名'}</span>
+          <span>
+            <span className="nick">{c.nickname || '匿名'}</span>
+            {!indent && c.pending && <b className="pending-n">待回复</b>}
+          </span>
           <span className="time mono">{fmtTime(c.createTime)}</span>
         </div>
-        <div className="content">{c.content}</div>
+        <div className="content">{formatWechatEmoji(c.content)}</div>
         <div className="meta">
           <span className="mono">赞 {c.likeCount}</span>
           <span className="meta-actions">

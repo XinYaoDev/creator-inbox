@@ -1,22 +1,89 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import LibraryTab from './LibraryTab'
 import PublishTab from './components/PublishTab'
 import AccountsTab from './components/AccountsTab'
+import NoteTab from './components/NoteTab'
+import UpdateBar from './components/UpdateBar'
 import CommentRow from './components/CommentRow'
 import Avatar from './components/Avatar'
 import { api, setToken } from './api'
 import { fmtTime, proxied } from './utils'
+import { formatWechatEmoji } from './wechatEmoji'
 import type {
-  Account, CommentItem, Group, MsgItem, SearchResults, SessionItem, Status, VideoItem,
+  Account, CommentItem, Group, MsgItem, SessionItem, Status, VideoItem,
 } from './types'
 
+const PREFS_KEY = 'inbox_prefs'
+const VIEWS = ['inbox', 'publish', 'settings', 'library', 'note'] as const
+type AppView = (typeof VIEWS)[number]
+
+type InboxPrefs = {
+  view?: AppView
+  inboxTab?: 'comments' | 'dm'
+  platform?: 'all' | 'wechat' | 'douyin'
+  groupFilter?: 'all' | number
+  statusFilter?: 'pending' | 'done' | 'all'
+  videoSort?: 'comment' | 'time'
+}
+
+function readInboxPrefs(): InboxPrefs {
+  try {
+    const p = JSON.parse(localStorage.getItem(PREFS_KEY) || '{}')
+    return p && typeof p === 'object' ? p : {}
+  } catch {
+    return {}
+  }
+}
+
+function NotesConfigLine() {
+  const [info, setInfo] = useState<{ llm: boolean; model: string; image: string } | null>(null)
+  useEffect(() => {
+    api('/api/notes/status')
+      .then((r) => r.json())
+      .then((d) => setInfo({ llm: Boolean(d.llm), model: String(d.model || ''), image: String(d.image || '') }))
+      .catch(() => {})
+  }, [])
+  if (!info) return null
+  const image =
+    info.image === 'pollinations' ? '演示源（未接模型）'
+      : info.image === 'hermes' ? 'Hermes'
+        : info.image === 'siliconflow' ? '硅基流动'
+          : info.image === 'fal' ? 'FAL'
+            : info.image === 'openai' ? 'OpenAI'
+              : info.image || '未接'
+  const copy = !info.llm
+    ? '未接，起草用本地底稿'
+    : info.model
+      ? `已接 ${info.model}`
+      : '已接模型'
+  return (
+    <div className="sysinfo">
+      做笔记 · 文案{copy} · 出图 {image}
+    </div>
+  )
+}
+
 export default function App() {
-  const [view, setView] = useState<'inbox' | 'publish' | 'settings' | 'library'>('inbox')
-  const [inboxTab, setInboxTab] = useState<'comments' | 'dm'>('comments')
-  const [platform, setPlatform] = useState<'all' | 'wechat' | 'douyin'>('all')
-  const [groupFilter, setGroupFilter] = useState<'all' | number>('all')
-  const [statusFilter, setStatusFilter] = useState<'pending' | 'done' | 'all'>('pending')
-  const [videoSort, setVideoSort] = useState<'comment' | 'time'>('comment')
+  const saved = readInboxPrefs()
+  const [view, setView] = useState<AppView>(
+    saved.view && (VIEWS as readonly string[]).includes(saved.view) ? saved.view : 'inbox',
+  )
+  const [inboxTab, setInboxTab] = useState<'comments' | 'dm'>(
+    saved.inboxTab === 'dm' ? 'dm' : 'comments',
+  )
+  const [platform, setPlatform] = useState<'all' | 'wechat' | 'douyin'>(
+    saved.platform === 'wechat' || saved.platform === 'douyin' ? saved.platform : 'all',
+  )
+  const [groupFilter, setGroupFilter] = useState<'all' | number>(
+    saved.groupFilter === 'all' || saved.groupFilter == null ? 'all'
+      : Number(saved.groupFilter) || 'all',
+  )
+  const [statusFilter, setStatusFilter] = useState<'pending' | 'done' | 'all'>(
+    saved.statusFilter === 'done' || saved.statusFilter === 'all' ? saved.statusFilter : 'pending',
+  )
+  const [videoSort, setVideoSort] = useState<'comment' | 'time'>(
+    saved.videoSort === 'time' ? 'time' : 'comment',
+  )
   const [status, setStatus] = useState<Status | null>(null)
   const [groups, setGroups] = useState<Group[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
@@ -30,17 +97,33 @@ export default function App() {
   const [dmInput, setDmInput] = useState('')
   const [dmSending, setDmSending] = useState(false)
   const [dmErr, setDmErr] = useState('')
-  const [searchQ, setSearchQ] = useState('')
-  const [searchRes, setSearchRes] = useState<SearchResults | null>(null)
   const [toast, setToast] = useState('')
   const [needAuth, setNeedAuth] = useState(false)
   const [tokenInput, setTokenInput] = useState('')
+  const appBodyRef = useRef<HTMLDivElement>(null)
+  const vlistRef = useRef<HTMLElement>(null)
+  const vdetailRef = useRef<HTMLElement>(null)
+  const sessionsRef = useRef<HTMLElement>(null)
+  const msgsRef = useRef<HTMLElement>(null)
+  const msgsFlowRef = useRef<HTMLDivElement>(null)
 
   // 服务端开启 AUTH_TOKEN 后，任一请求 401 即弹出令牌输入框
   useEffect(() => {
     const on401 = () => setNeedAuth(true)
     window.addEventListener('inbox:unauthorized', on401)
     return () => window.removeEventListener('inbox:unauthorized', on401)
+  }, [])
+
+  // 桌面壳没有浏览器刷新；⌘R / Ctrl+R 重新拉页面，才能看到 NAS 上的新前端
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'r' || e.key === 'R')) {
+        e.preventDefault()
+        window.location.reload()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
   }, [])
 
   const loadAccounts = useCallback(async () => {
@@ -67,7 +150,7 @@ export default function App() {
     setSessions(ss.list || [])
   }, [platform, groupFilter, statusFilter, videoSort])
 
-  // 列表变化后，保持/重选当前视频
+  // 列表变化后，保持/重选当前视频（仍在列表里就留着；处理完离开「待处理」则落到下一条）
   useEffect(() => {
     if (!videoList.length) {
       setCurVideo(null)
@@ -88,6 +171,30 @@ export default function App() {
     setVideoComments(d.list || [])
   }, [])
 
+  // 点进视频只选中；没回就切到下一条时，把上一条未回复标完成，「待回复」才消失。
+  const selectVideo = useCallback(async (key: string) => {
+    if (key === curVideo) return
+    if (curVideo) {
+      const prev = videoList.find((v) => `${v.platform}:${v.accountId}:${v.objectId}` === curVideo)
+      if (prev && prev.pendingCount > 0) {
+        const [p, accId, ...rest] = curVideo.split(':')
+        await api('/api/handled', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            platform: p,
+            accountId: Number(accId),
+            kind: 'video',
+            targetId: rest.join(':'),
+            done: true,
+          }),
+        })
+      }
+    }
+    setCurVideo(key)
+    load()
+  }, [curVideo, videoList, load])
+
   useEffect(() => {
     if (curVideo) loadVideoComments(curVideo)
     else setVideoComments([])
@@ -107,6 +214,29 @@ export default function App() {
     setMsgs(d.list || [])
   }, [])
 
+  // 点进会话只选中；没回就切到下一条时，上一条算已读。
+  const selectSession = useCallback(async (key: string) => {
+    if (key === cur) return
+    if (cur) {
+      const prev = sessions.find((s) => `${s.platform}:${s.accountId}:${s.sessionId}` === cur)
+      if (prev && prev.pending) {
+        await api('/api/handled', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            platform: prev.platform,
+            accountId: prev.accountId,
+            kind: 'session',
+            targetId: prev.sessionId,
+            done: true,
+          }),
+        })
+      }
+    }
+    setCur(key)
+    load()
+  }, [cur, sessions, load])
+
   useEffect(() => {
     if (cur) loadMsgs(cur)
     else setMsgs([])
@@ -115,6 +245,17 @@ export default function App() {
   useEffect(() => {
     loadAccounts()
   }, [loadAccounts])
+
+  useEffect(() => {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({
+      view, inboxTab, platform, groupFilter, statusFilter, videoSort,
+    }))
+  }, [view, inboxTab, platform, groupFilter, statusFilter, videoSort])
+
+  useEffect(() => {
+    if (groupFilter === 'all' || groups.length === 0) return
+    if (!groups.some((g) => g.id === groupFilter)) setGroupFilter('all')
+  }, [groups, groupFilter])
 
   useEffect(() => {
     load()
@@ -179,37 +320,6 @@ export default function App() {
     reloadCurrent()
   }
 
-  // 搜索
-  useEffect(() => {
-    if (!searchQ.trim()) {
-      setSearchRes(null)
-      return
-    }
-    const t = setTimeout(async () => {
-      const d = await api(`/api/search?q=${encodeURIComponent(searchQ.trim())}`).then((r) => r.json())
-      setSearchRes(d)
-    }, 300)
-    return () => clearTimeout(t)
-  }, [searchQ])
-
-  const jumpToVideo = (platform2: string, accountId: number, objectId: string) => {
-    setSearchRes(null)
-    setSearchQ('')
-    setView('inbox')
-    setInboxTab('comments')
-    setStatusFilter('all')
-    setCurVideo(`${platform2}:${accountId}:${objectId}`)
-    loadVideoComments(`${platform2}:${accountId}:${objectId}`)
-  }
-  const jumpToSession = (platform2: string, accountId: number, sessionId: string) => {
-    setSearchRes(null)
-    setSearchQ('')
-    setView('inbox')
-    setInboxTab('dm')
-    setStatusFilter('all')
-    setCur(`${platform2}:${accountId}:${sessionId}`)
-  }
-
   const saveToken = () => {
     setToken(tokenInput)
     setTokenInput('')
@@ -227,63 +337,44 @@ export default function App() {
   const pendingTotal = (status?.counts.pendingComments ?? 0) + (status?.counts.pendingSessions ?? 0)
   const brokenPlatforms = Object.entries(status?.platforms || {}).filter(([, p]) => p.hasCookie && p.cookieValid === false)
 
-  return (
-    <div className="page">
-      <header className="topbar">
-        <div className="brand">Creator Inbox</div>
-        <div className="topbar-summary mono">
-          {status
-            ? `${status.counts.comments} 条评论 · ${status.counts.messages} 条私信 · ${pendingTotal} 待处理`
-            : '载入中…'}
-        </div>
-        <div className="topbar-actions">
-          <div className="searchwrap">
-            <input
-              className="searchbox"
-              value={searchQ}
-              onChange={(e) => setSearchQ(e.target.value)}
-              placeholder="搜索评论 / 私信"
-            />
-            {searchRes && (
-              <div className="searchres">
-                {searchRes.comments.length === 0 && searchRes.sessions.length === 0 && (
-                  <div className="empty">无匹配结果</div>
-                )}
-                {searchRes.sessions.map((s) => (
-                  <button
-                    key={`s${s.accountId}:${s.sessionId}`}
-                    className="searchrow"
-                    onClick={() => jumpToSession(s.platform, s.accountId, s.sessionId)}
-                  >
-                    <span className="ptag">私信</span> {s.nickname || '未知用户'}
-                  </button>
-                ))}
-                {searchRes.comments.map((c) => (
-                  <button
-                    key={`c${c.accountId}:${c.commentId}`}
-                    className="searchrow"
-                    onClick={() => jumpToVideo(c.platform, c.accountId, c.exportId)}
-                  >
-                    <span className="ptag">评论</span>
-                    <span className="searchrow-main">
-                      {c.nickname}：{c.content.slice(0, 30)}
-                      <span className="time mono">{fmtTime(c.createTime)}</span>
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-          <button className="iconbtn" title="刷新" onClick={refresh} disabled={busy || status?.collecting}>
-            {busy || status?.collecting ? '…' : '↻'}
-          </button>
-          <button className="iconbtn" title="素材库" onClick={() => setView('library')}>素材库</button>
-          <button className="iconbtn publish-btn" onClick={() => setView('publish')}>+ 发布</button>
-          <button className="iconbtn" title="设置" onClick={() => setView('settings')}>⚙</button>
-          {toast && <span className="pub-ok">{toast}</span>}
-        </div>
-      </header>
+  const goView = (id: typeof view) => {
+    if (id === 'inbox' && view === 'inbox') {
+      for (const el of [appBodyRef.current, vlistRef.current, vdetailRef.current, sessionsRef.current, msgsRef.current, msgsFlowRef.current]) {
+        if (el) el.scrollTop = 0
+      }
+    }
+    setView(id)
+  }
 
+  const nav = (id: typeof view, label: string, extra?: ReactNode) => (
+    <button className={view === id ? 'navitem active' : 'navitem'} onClick={() => goView(id)}>
+      {label}
+      {extra}
+    </button>
+  )
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="sidebar-brand">Creator Inbox</div>
+        <nav className="sidebar-nav">
+          {nav(
+            'inbox',
+            '收件箱',
+            pendingTotal > 0 ? <b className="tab-badge">{pendingTotal}</b> : null,
+          )}
+          {nav('note', '做笔记')}
+          {nav('library', '素材库')}
+          {nav('publish', '发布')}
+        </nav>
+        <div className="sidebar-foot">
+          <UpdateBar />
+          {nav('settings', '设置')}
+        </div>
+      </aside>
+
+      <div className="app-main">
+      <div className="app-body" ref={appBodyRef}>
       {brokenPlatforms.map(([k, p]) => (
         <div className="errbar" key={k}>
           ⚠ {p.name}登录已失效
@@ -293,30 +384,21 @@ export default function App() {
       {status?.lastError && !brokenPlatforms.length && <div className="errbar">采集异常:{status.lastError}</div>}
 
       {view === 'publish' && (
-        <>
-          <nav className="tabs">
-            <button className="tab active">发表</button>
-            <button className="tab" onClick={() => setView('inbox')}>← 返回收件箱</button>
-          </nav>
-          <PublishTab groups={groups} accounts={accounts} />
-        </>
+        <PublishTab groups={groups} accounts={accounts} />
       )}
 
       {view === 'settings' && (
         <>
-          <nav className="tabs">
-            <button className="tab active">设置</button>
-            <button className="tab" onClick={() => setView('inbox')}>← 返回收件箱</button>
-          </nav>
           <div className="sysinfo mono">
             最后采集 {fmtTime(status?.lastCollect)} · 评论 {status?.counts.comments ?? '—'}（视频号{' '}
             {status?.counts.byPlatform?.wechat?.comments ?? 0} / 抖音 {status?.counts.byPlatform?.douyin?.comments ?? 0}）
             · 会话 {status?.counts.sessions ?? '—'} · 私信 {status?.counts.messages ?? '—'}
           </div>
+          <NotesConfigLine />
           <AccountsTab
             groups={groups}
             accounts={accounts}
-            onChanged={loadAccounts}
+            onChanged={() => { loadAccounts(); load() }}
             lastCollect={status?.lastCollect ?? null}
             onRecollect={refresh}
           />
@@ -324,9 +406,11 @@ export default function App() {
       )}
 
       {view === 'library' && (
-        <>
-          <LibraryTab onBack={() => setView('inbox')} />
-        </>
+        <LibraryTab />
+      )}
+
+      {view === 'note' && (
+        <NoteTab />
       )}
 
       {view === 'inbox' && (
@@ -372,11 +456,17 @@ export default function App() {
                 <option value="time">按发布时间</option>
               </select>
             )}
+            <span className="filterbar-actions">
+              <button className="iconbtn" title="刷新" onClick={refresh} disabled={busy || status?.collecting}>
+                {busy || status?.collecting ? '…' : '↻'}
+              </button>
+              {toast && <span className="pub-ok">{toast}</span>}
+            </span>
           </div>
 
           {inboxTab === 'comments' && (
             <main className="comments-layout">
-              <aside className="vlist">
+              <aside className="vlist" ref={vlistRef}>
                 {videoList.length === 0 && (
                   <div className="empty">{statusFilter === 'pending' ? '没有待处理的评论 🎉' : '暂无视频'}</div>
                 )}
@@ -386,7 +476,7 @@ export default function App() {
                     <button
                       key={key}
                       className={`vrow${key === curVideo ? ' active' : ''}${v.pendingCount === 0 ? ' done' : ''}`}
-                      onClick={() => setCurVideo(key)}
+                      onClick={() => selectVideo(key)}
                     >
                       {v.thumbUrl ? (
                         <img className="vrow-thumb" src={proxied(v.thumbUrl)} alt="" loading="lazy" />
@@ -409,7 +499,7 @@ export default function App() {
                   )
                 })}
               </aside>
-              <section className="vdetail">
+              <section className="vdetail" ref={vdetailRef}>
                 {!curVideo && <div className="empty">选择左侧视频查看评论</div>}
                 {curVideo && (
                   <>
@@ -429,6 +519,7 @@ export default function App() {
                             </div>
                             <div className="vcard-meta mono">
                               发布 {fmtTime(v.createTime)} · 评论 {v.commentCount}
+                              {v.pendingCount > 0 ? <> · <b className="pending-n">{v.pendingCount} 条待回复</b></> : null}
                               {accountLabel(v.accountId) ? ` · ${accountLabel(v.accountId)}` : ''}
                             </div>
                           </div>
@@ -437,7 +528,7 @@ export default function App() {
                     })()}
                     <div className="vcomments">
                       {videoComments.length === 0 && <div className="empty">暂无评论</div>}
-                      {videoComments.map((c) => (
+                      {[...videoComments].sort((a, b) => Number(b.pending) - Number(a.pending)).map((c) => (
                         <div key={c.commentId}>
                           <CommentRow c={c} onSent={reloadCurrent} onToggleDone={(cc, done) => toggleDone(cc, 'comment', cc.commentId, done)} />
                           {(c.replies || []).map((r) => (
@@ -454,7 +545,7 @@ export default function App() {
 
           {inboxTab === 'dm' && (
             <main className="dm">
-              <aside className="sessions">
+              <aside className="sessions" ref={sessionsRef}>
                 {sessions.length === 0 && (
                   <div className="empty">{statusFilter === 'pending' ? '没有待回复的私信 🎉' : '暂无私信会话'}</div>
                 )}
@@ -464,7 +555,7 @@ export default function App() {
                     <button
                       key={key}
                       className={`session${key === cur ? ' active' : ''}${!s.pending ? ' done' : ''}`}
-                      onClick={() => setCur(key)}
+                      onClick={() => selectSession(key)}
                     >
                       <Avatar url={s.headImgUrl} name={s.nickname} />
                       <div className="session-main">
@@ -476,14 +567,14 @@ export default function App() {
                           <span className="time mono">{fmtTime(s.lastTs)}</span>
                         </div>
                         <div className="preview">
-                          {s.lastContent || '（暂无消息）'} <span className="mono">· {s.msgCount} 条</span>
+                          {formatWechatEmoji(s.lastContent || '') || '（暂无消息）'} <span className="mono">· {s.msgCount} 条</span>
                         </div>
                       </div>
                     </button>
                   )
                 })}
               </aside>
-              <section className="msgs">
+              <section className="msgs" ref={msgsRef}>
                 {!cur && <div className="empty">选择左侧会话查看消息</div>}
                 {cur && (
                   <>
@@ -501,11 +592,11 @@ export default function App() {
                         </button>
                       )}
                     </div>
-                    <div className="msgs-flow">
+                    <div className="msgs-flow" ref={msgsFlowRef}>
                       {msgs.map((m) => (
                         <div key={m.svrMsgId} className={m.self ? 'msg self' : 'msg'}>
                           <div className="bubble">
-                            <div className="content">{m.content}</div>
+                            <div className="content">{formatWechatEmoji(m.content)}</div>
                             <div className="time mono">{fmtTime(m.ts)}</div>
                           </div>
                         </div>
@@ -553,6 +644,8 @@ export default function App() {
           </div>
         </div>
       )}
+      </div>
+      </div>
     </div>
   )
 }

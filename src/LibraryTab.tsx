@@ -40,7 +40,7 @@ const fmtDate = (s?: number | null) =>
 const fmtFull = (s?: number | null) =>
   s ? new Date(s * 1000).toLocaleString('zh-CN') : '—'
 
-export default function LibraryTab({ onBack }: { onBack: () => void }) {
+export default function LibraryTab({ onBack }: { onBack?: () => void }) {
   const [assets, setAssets] = useState<Asset[]>([])
   const [total, setTotal] = useState(0)
   const [facets, setFacets] = useState<FacetNode[]>([])
@@ -172,7 +172,9 @@ export default function LibraryTab({ onBack }: { onBack: () => void }) {
         <button className="tab active">
           素材库 <b className="tab-badge">{total}</b>
         </button>
-        <button className="tab" onClick={onBack}>← 返回收件箱</button>
+        {onBack && (
+          <button className="tab" onClick={onBack}>← 返回收件箱</button>
+        )}
       </nav>
 
       <div className="libtoolbar">

@@ -27,7 +27,7 @@ Missing/wrong token → `401`. Static UI assets are still served without auth so
 | POST | `/api/groups` | Create account group `{name}` |
 | POST | `/api/accounts` | Create account `{groupId, platform, label, cookie?}` |
 | POST | `/api/accounts/:id/cookie` | Update account cookie `{cookie}` |
-| DELETE | `/api/accounts/:id` | Remove account |
+| DELETE | `/api/accounts/:id` | Remove account and cascade its videos/comments/DMs |
 | DELETE | `/api/groups/:id` | Remove group |
 
 ## Comments
@@ -36,7 +36,7 @@ Missing/wrong token → `401`. Static UI assets are still served without auth so
 |---|---|---|
 | GET | `/api/comments` | Comments. Query: `platform`, `accountId`, `pending` (1/0), `limit`, `offset` |
 | GET | `/api/video/comments` | Comments for a video. Query: `platform`, `accountId`, `objectId` |
-| POST | `/api/handled` | Mark comment(s) handled: `{platform, accountId, commentIds[]}` or `{allPending: true}` |
+| POST | `/api/handled` | Mark handled: `{platform, accountId, kind: 'comment'\|'session'\|'video', targetId, done}`. `kind=video` marks remaining pending comments on that video (used when leaving it unread). |
 | POST | `/api/comments/:commentId/reply` | Reply to a comment `{content}` (platform-dependent support) |
 | GET | `/api/search` | Search comments & messages. Query: `q` |
 
@@ -78,6 +78,44 @@ Library routes are delegated to `server/library.js` (prefix `/api/library/`).
 | DELETE | `/api/library/files/:id` | Remove file (varies) |
 
 > Detailed library API is under active development; check `server/library.js` for the current surface.
+
+## Xiaohongshu notes (draft)
+
+One note at a time: material → copy (style + lint) → storyboard → generate. Images are stored under `data/notes/`.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/notes/status` | Whether LLM key is set, and which image provider will be used (`hermes` / `fal` / `pollinations` / …) |
+| POST | `/api/notes/draft` | `{material, topic}` → `{title, body, tags, style, lint, rewritten}` guest-voice copy. Picks a style, then regex+LLM lint; rewrites up to twice. |
+| POST | `/api/notes/lint` | `{title, body, material, style, rewrite?}` → `{lint, title, body}`. `rewrite:true` asks the model to fix fails. |
+| POST | `/api/notes/storyboard` | `{topic, body}` → `{slots: [{id, role, want, prompt}]}` |
+| POST | `/api/notes/generate` | `{slots}` → `{results: [{id, imageId}]}` |
+| POST | `/api/notes/generate-one` | `{prompt, n}` → `{imageIds}` variants for one slot |
+| GET | `/api/notes/file?id=` | JPEG for a generated image |
+
+Drafting records today's material into `data/assets/materials.jsonl` and, when enough cases exist, uses them as few-shot examples instead of the built-in ones.
+
+## Note assets
+
+Stored as JSONL under `data/assets/` (`materials.jsonl`, `notes.jsonl`, `cases.jsonl`) plus optional `banned.txt` (one extra banned word per line). Learning a Xiaohongshu URL goes through the Mac Hermes bridge (`POST /xhs-note`), which uses the local Kimi WebBridge session — NAS cannot fetch Xiaohongshu itself.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/assets/summary` | Counts plus last 5 saved notes (for backfill) and last 5 reference cases |
+| POST | `/api/assets/note` | Save a finished draft `{title, body, tags, style, material, url?}`. Same title+body as the previous row is a no-op |
+| POST | `/api/assets/backfill` | `{id, likes, favorites, comments, shares}` → writes `stats` on that draft |
+| POST | `/api/assets/learn` | `{url}` Xiaohongshu note link → fetch via Mac bridge, store as a case |
+| POST | `/api/assets/case` | Manual case when the bridge is down (`title` / `excerpt` / counts) |
+
+## App update (payload, not the Mac .app)
+
+Compares local `package.json` version with GitHub Releases, and `git fetch` vs upstream. Apply pulls code, `npm install && npm run build`, restarts Node. Refuses inside Docker. Leaves `data/` untouched.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/update/check` | `{available, current, latest, reason, docker}` |
+| GET | `/api/update/status` | Same plus `stage`, `log`, `error` |
+| POST | `/api/update/apply` | Start update (async). Poll status until the server restarts |
 
 ## Data Model (SQLite)
 

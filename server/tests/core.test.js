@@ -11,7 +11,7 @@ const path = require('node:path');
 process.env.DB_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'inbox-test-')), 'test.db');
 
 const {
-  dyParseTime, pick, isAuthError, avatarHostAllowed, accountCond, pendingCommentCond, wxExtractUuid,
+  dyParseTime, pick, isAuthError, isWxRetryable, avatarHostAllowed, accountCond, pendingCommentCond, wxExtractUuid,
 } = require('../index.js');
 
 test('dyParseTime: 秒级时间戳直接透传', () => {
@@ -47,6 +47,13 @@ test('isAuthError: 只认鉴权类错误，限流不算', () => {
   assert.strictEqual(isAuthError('Forbidden'), true);
 });
 
+test('isWxRetryable: 300011/300333/频繁可重试，登录失效不重试', () => {
+  assert.strictEqual(isWxRetryable('comment_list errCode=300011 errMsg=request failed'), true);
+  assert.strictEqual(isWxRetryable('post_list errCode=300333 errMsg=request failed'), true);
+  assert.strictEqual(isWxRetryable('请求过于频繁，请稍后再试'), true);
+  assert.strictEqual(isWxRetryable('登录已失效，请重新登录'), false);
+});
+
 test('avatarHostAllowed: 白名单精确匹配 + 后缀，拒绝形似域名', () => {
   assert.strictEqual(avatarHostAllowed('wx.qlogo.cn'), true);
   assert.strictEqual(avatarHostAllowed('a.b.douyinpic.com'), true);
@@ -56,9 +63,9 @@ test('avatarHostAllowed: 白名单精确匹配 + 后缀，拒绝形似域名', (
   assert.strictEqual(avatarHostAllowed('douyinpic.com.evil.com'), false);
 });
 
-test('accountCond: null 不筛选，空数组强制无结果，其余拼 IN', () => {
+test('accountCond: 未筛分组时仍限定现存账号，空数组强制无结果，其余拼 IN', () => {
   const args = [];
-  assert.strictEqual(accountCond('c.accountId', null, args), '1=1');
+  assert.match(accountCond('c.accountId', null, args), /c\.accountId IN \(SELECT id FROM accounts\)/);
   assert.strictEqual(accountCond('c.accountId', [], args), '1=0');
   assert.strictEqual(accountCond('c.accountId', [1, 2], args), 'c.accountId IN (?,?)');
   assert.deepStrictEqual(args, [1, 2]);

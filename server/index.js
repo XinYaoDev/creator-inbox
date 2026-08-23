@@ -5,6 +5,9 @@
 'use strict';
 
 const createLibrary = require('./library.js');
+const createNotes = require('./notes.js');
+const createAssets = require('./assets.js');
+const createUpdate = require('./update.js');
 
 const http = require('node:http');
 const fs = require('node:fs');
@@ -231,6 +234,24 @@ CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(platform, accountId, e
 CREATE INDEX IF NOT EXISTS idx_comments_root ON comments(platform, accountId, rootCommentId);
 `);
 
+// 删账号后若旧版本没级联，评论/视频会变成孤儿继续出现在收件箱。启动时扫一遍。
+function purgeOrphanAccountData() {
+  db.exec(`
+    DELETE FROM comments WHERE accountId NOT IN (SELECT id FROM accounts);
+    DELETE FROM videos WHERE accountId NOT IN (SELECT id FROM accounts);
+    DELETE FROM dm_messages WHERE accountId NOT IN (SELECT id FROM accounts);
+    DELETE FROM dm_sessions WHERE accountId NOT IN (SELECT id FROM accounts);
+    DELETE FROM handled_marks WHERE accountId NOT IN (SELECT id FROM accounts);
+  `);
+}
+function deleteAccountData(accountId) {
+  for (const t of ['videos', 'comments', 'dm_sessions', 'dm_messages']) {
+    db.prepare(`DELETE FROM ${t} WHERE accountId = ?`).run(accountId);
+  }
+  db.prepare('DELETE FROM handled_marks WHERE accountId = ?').run(accountId);
+}
+purgeOrphanAccountData();
+
 function listAccounts() {
   return db.prepare('SELECT * FROM accounts ORDER BY id').all();
 }
@@ -268,7 +289,7 @@ const upMessage = db.prepare(`INSERT INTO dm_messages(platform,accountId,svrMsgI
 const WX_BASE = 'https://channels.weixin.qq.com';
 const WX_COMMON = {
   _log_finder_uin: '',
-  _log_finder_id: 'v2_060000231003b20faec8c4ea8911c0d1c603ec35b077cc8c2950945db6825f2e3f6aefdcc82a@finder',
+  _log_finder_id: '',
   rawKeyBuff: '',
   pluginSessionId: null,
   scene: 7,
@@ -279,8 +300,19 @@ const CGI = '/micro/interaction/cgi-bin/mmfinderassistant-bin';
 async function wxApi(acc, p, extra) {
   const res = await fetch(WX_BASE + p, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Cookie: acc.cookie, 'User-Agent': UA },
-    body: JSON.stringify({ timestamp: String(Date.now()), ...WX_COMMON, ...extra }),
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: acc.cookie,
+      'User-Agent': UA,
+      Origin: WX_BASE,
+      Referer: `${WX_BASE}/micro/interaction/comment`,
+    },
+    body: JSON.stringify({
+      timestamp: String(Date.now()),
+      ...WX_COMMON,
+      _log_finder_id: acc.username || '',
+      ...extra,
+    }),
     signal: AbortSignal.timeout(20000),
   });
   const text = await res.text();
@@ -295,6 +327,12 @@ async function wxApi(acc, p, extra) {
 // 只记 lastError，否则会误报「登录已失效」引导用户反复重新扫码
 function isAuthError(msg) {
   return /重新登录|登录已失效|未登录|登录态|登陆失效|凭证|授权失效|unauthorized|forbidden/i.test(String(msg || ''));
+}
+
+// 视频号 300011/300333「request failed」是上游泛失败（限流/风控/瞬时），不是登录失效。
+function isWxRetryable(msg) {
+  const s = String(msg || '');
+  return /频繁/.test(s) || /errCode=(300011|300333|-1)\b/.test(s) || /request failed/i.test(s);
 }
 
 function wxCheck(acc, r, stage) {
@@ -408,13 +446,13 @@ async function wxCollectCommentsForVideoOnce(acc, objectId, result) {
   }
 }
 
-// 视频号有限流（errCode=-1 请求过于频繁）：带退避重试
+// 视频号有限流（errCode=-1 请求过于频繁）和 300011/300333 泛失败：带退避重试
 async function wxCollectCommentsForVideo(acc, objectId, result) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       return await wxCollectCommentsForVideoOnce(acc, objectId, result);
     } catch (e) {
-      if (!String(e && e.message || e).includes('频繁') || attempt === 2) throw e;
+      if (!isWxRetryable(e && e.message) || attempt === 2) throw e;
       await sleep(5000 * (attempt + 1));
     }
   }
@@ -429,30 +467,39 @@ async function pool(limit, tasks) {
   await Promise.all(workers);
 }
 
-// 未读小红点信号（post_list onlyUnread=true）调研结论：该集合包含点赞/弹幕等所有未读互动，
-// 且在官方端被阅读前永不消失——作为增量候选会让集合永远很大。新评论一定会让 commentCount +1，
-// 所以增量采集按评论数差值驱动，每 12 轮全量兜底漂移。
-// 差值驱动的盲区：删一条+新增一条时 commentCount 不变，新评论会漏到下一轮全量。
-// 缓解：近 7 天发布的视频每轮都重采（新视频互动密度高，量也可控）。
-const RECENT_VIDEO_SEC = 7 * 86400;
+// 评论只跟活的：commentCount 变了（新评必 +1）或近 2 天新片。
+// 不做定时/启动全量——旧片删 1 加 1 且总数不变会漏到下次 count 变化，民宿可接受。
+// 未读小红点含点赞/弹幕且点开前不消失，不能当增量信号。
+const RECENT_VIDEO_SEC = 2 * 86400;
 
-async function wxCollectComments(acc, result, full, prevCounts) {
-  let targets;
-  if (full) {
-    targets = db.prepare("SELECT objectId FROM videos WHERE platform='wechat' AND accountId=? AND commentCount > 0")
-      .all(acc.id).map((r) => r.objectId);
-  } else {
-    // 增量：评论数变化 ∪ 从没采过评论的 ∪ 近 7 天发布的
-    const cutoff = Math.floor(Date.now() / 1000) - RECENT_VIDEO_SEC;
-    const rows = db.prepare("SELECT objectId, commentCount, createTime FROM videos WHERE platform='wechat' AND accountId=? AND commentCount > 0")
-      .all(acc.id);
-    targets = rows
-      .filter((r) => prevCounts.get(r.objectId) !== r.commentCount || (r.createTime || 0) > cutoff)
-      .map((r) => r.objectId);
-    result.incremental = { total: rows.length, hit: targets.length };
+function commentDeltaTargets(platform, accountId, prevCounts) {
+  const cutoff = Math.floor(Date.now() / 1000) - RECENT_VIDEO_SEC;
+  const rows = db.prepare(
+    'SELECT objectId, commentCount, createTime FROM videos WHERE platform=? AND accountId=? AND commentCount > 0')
+    .all(platform, accountId);
+  const targets = rows
+    .filter((r) => prevCounts.get(r.objectId) !== r.commentCount || (r.createTime || 0) > cutoff)
+    .map((r) => r.objectId);
+  return { total: rows.length, hit: targets.length, targets };
+}
+
+async function wxCollectComments(acc, result, prevCounts) {
+  const { total, hit, targets } = commentDeltaTargets('wechat', acc.id, prevCounts);
+  result.incremental = { total, hit };
+  let skipped = 0;
+  await pool(1, targets.map((objectId) => async () => {
+    try {
+      await wxCollectCommentsForVideo(acc, objectId, result);
+    } catch (e) {
+      skipped++;
+      console.warn(`[wx] comment_list skip objectId=${objectId}: ${e && e.message || e}`);
+    }
+    await sleep(400 + Math.floor(Math.random() * 500));
+  }));
+  if (skipped) result.commentSkipped = skipped;
+  if (skipped === targets.length && targets.length) {
+    throw new Error(`comment_list 全部失败（${skipped} 个视频）`);
   }
-  // 2 路并发拉评论（视频号有限流，快了会吃「请求过于频繁」）
-  await pool(2, targets.map((objectId) => () => wxCollectCommentsForVideo(acc, objectId, result)));
 }
 
 async function wxCollectDM(acc, result) {
@@ -498,13 +545,13 @@ async function wxFetchProfile(acc) {
   }
 }
 
-async function wxCollect(acc, result, full) {
+async function wxCollect(acc, result) {
   // 快照旧评论数（wxCollectVideos 会覆盖新值），用于增量比对
   const prevCounts = new Map(
     db.prepare("SELECT objectId, commentCount FROM videos WHERE platform='wechat' AND accountId=?")
       .all(acc.id).map((r) => [r.objectId, r.commentCount]));
   await wxCollectVideos(acc, result);
-  await wxCollectComments(acc, result, full, prevCounts);
+  await wxCollectComments(acc, result, prevCounts);
   await wxCollectDM(acc, result);
   try { await wxFetchProfile(acc); } catch { /* 资料抓取失败不影响采集 */ }
 }
@@ -645,21 +692,13 @@ async function dyCollectCommentsForVideo(acc, awemeId, result) {
   }
 }
 
-async function dyCollectComments(acc, result, full, prevCounts) {
-  let targets;
-  if (full) {
-    targets = db.prepare("SELECT objectId FROM videos WHERE platform='douyin' AND accountId=? AND commentCount > 0")
-      .all(acc.id).map((r) => r.objectId);
-  } else {
-    const cutoff = Math.floor(Date.now() / 1000) - RECENT_VIDEO_SEC;
-    const rows = db.prepare("SELECT objectId, commentCount, createTime FROM videos WHERE platform='douyin' AND accountId=? AND commentCount > 0")
-      .all(acc.id);
-    targets = rows
-      .filter((r) => prevCounts.get(r.objectId) !== r.commentCount || (r.createTime || 0) > cutoff)
-      .map((r) => r.objectId);
-    result.incremental = { total: rows.length, hit: targets.length };
-  }
-  await pool(4, targets.map((objectId) => () => dyCollectCommentsForVideo(acc, objectId, result)));
+async function dyCollectComments(acc, result, prevCounts) {
+  const { total, hit, targets } = commentDeltaTargets('douyin', acc.id, prevCounts);
+  result.incremental = { total, hit };
+  await pool(2, targets.map((objectId) => async () => {
+    await dyCollectCommentsForVideo(acc, objectId, result);
+    await sleep(200);
+  }));
 }
 
 async function dyFetchProfile(acc) {
@@ -670,12 +709,12 @@ async function dyFetchProfile(acc) {
   }
 }
 
-async function dyCollect(acc, result, full) {
+async function dyCollect(acc, result) {
   const prevCounts = new Map(
     db.prepare("SELECT objectId, commentCount FROM videos WHERE platform='douyin' AND accountId=?")
       .all(acc.id).map((r) => [r.objectId, r.commentCount]));
   await dyCollectVideos(acc, result);
-  await dyCollectComments(acc, result, full, prevCounts);
+  await dyCollectComments(acc, result, prevCounts);
   try { await dyFetchProfile(acc); } catch { /* 资料抓取失败不影响采集 */ }
   // 私信：抖音走 imapi.douyin.com IM 体系（需 IM token + 自定义头），逆向成本高，第二批再接入
 }
@@ -686,15 +725,12 @@ const COLLECTORS = { wechat: wxCollect, douyin: dyCollect };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let collecting = false;
-let collectRound = 0;
+const COLLECT_INTERVAL_MS = 10 * 60 * 1000;
 async function collectAll(trigger = 'auto') {
   if (collecting) return { skipped: true, msg: '上一次采集尚未结束' };
   collecting = true;
-  collectRound++;
-  // 每 12 轮全量扫一次（捕捉删评论/编辑等漂移），启动时也全量
-  const full = trigger === 'startup' || collectRound % 12 === 1;
   const startedAt = Math.floor(Date.now() / 1000);
-  const result = { trigger, full, accounts: {}, errors: [] };
+  const result = { trigger, accounts: {}, errors: [] };
   const all = listAccounts();
   const active = [];
   for (const acc of all) {
@@ -722,7 +758,7 @@ async function collectAll(trigger = 'auto') {
       if (!first) await sleep(2500);
       first = false;
       try {
-        await collect(acc, r, full);
+        await collect(acc, r);
         setCookieValid(acc.id, true);
         db.prepare("UPDATE accounts SET lastError = '' WHERE id = ?").run(acc.id);
         r.ok = true;
@@ -742,7 +778,7 @@ async function collectAll(trigger = 'auto') {
   db.prepare('DELETE FROM collect_log WHERE id NOT IN (SELECT id FROM collect_log ORDER BY id DESC LIMIT 200)').run();
   db.prepare('DELETE FROM avatar_cache WHERE ts < ?').run(startedAt - 7 * 86400);
   collecting = false;
-  console.log(`[collect] ${trigger} ok=${result.ok} full=${full}`, JSON.stringify(result));
+  console.log(`[collect] ${trigger} ok=${result.ok}`, JSON.stringify(result));
   return result;
 }
 
@@ -787,9 +823,13 @@ function accountIdsForGroup(groupId) {
   if (!groupId) return null;
   return db.prepare('SELECT id FROM accounts WHERE groupId = ?').all(Number(groupId)).map((r) => r.id);
 }
-// 拼 accountId IN (...) 条件；ids 为空数组时强制无结果
+// 拼 accountId IN (...) 条件。未筛分组时仍只看还在的账号，避免已删账号的孤儿评论/视频漏出来。
+// ids 为空数组时强制无结果。
+function liveAccountCond(col) {
+  return `${col} IN (SELECT id FROM accounts)`;
+}
 function accountCond(col, ids, args) {
-  if (ids === null) return '1=1';
+  if (ids === null) return liveAccountCond(col);
   if (!ids.length) return '1=0';
   args.push(...ids);
   return `${col} IN (${ids.map(() => '?').join(',')})`;
@@ -1286,7 +1326,6 @@ async function wxLoginChoose(s, finderUsername) {
 const routes = {
   'GET /api/status': (req, res) => {
     const { lastCollect, lastResult } = lastCollectInfo();
-    const count = (t) => db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
     const accounts = listAccounts();
     // 平台聚合状态：任一账号失效即失效；全有效才有效；都没采过为未知
     const platforms = {};
@@ -1311,23 +1350,24 @@ const routes = {
       platforms,
       lastError: lastResult && !lastResult.ok ? (lastResult.errors || []).join('; ') : null,
       counts: {
-        videos: count('videos'),
-        comments: count('comments'),
-        sessions: count('dm_sessions'),
-        messages: count('dm_messages'),
-        pendingComments: db.prepare(`SELECT COUNT(*) AS n FROM comments c WHERE ${pendingCommentCond('c')}`).get().n,
+        videos: db.prepare(`SELECT COUNT(*) AS n FROM videos WHERE ${liveAccountCond('accountId')}`).get().n,
+        comments: db.prepare(`SELECT COUNT(*) AS n FROM comments WHERE ${liveAccountCond('accountId')}`).get().n,
+        sessions: db.prepare(`SELECT COUNT(*) AS n FROM dm_sessions WHERE ${liveAccountCond('accountId')}`).get().n,
+        messages: db.prepare(`SELECT COUNT(*) AS n FROM dm_messages WHERE ${liveAccountCond('accountId')}`).get().n,
+        pendingComments: db.prepare(`SELECT COUNT(*) AS n FROM comments c WHERE ${liveAccountCond('c.accountId')} AND ${pendingCommentCond('c')}`).get().n,
         pendingSessions: db.prepare(`
           SELECT COUNT(*) AS n FROM dm_sessions s
-          WHERE (SELECT fromUsername FROM dm_messages m WHERE m.platform = s.platform AND m.accountId = s.accountId AND m.sessionId = s.sessionId ORDER BY ts DESC LIMIT 1) = s.username
+          WHERE ${liveAccountCond('s.accountId')}
+            AND (SELECT fromUsername FROM dm_messages m WHERE m.platform = s.platform AND m.accountId = s.accountId AND m.sessionId = s.sessionId ORDER BY ts DESC LIMIT 1) = s.username
             AND NOT EXISTS (SELECT 1 FROM handled_marks h WHERE h.platform = s.platform AND h.accountId = s.accountId AND h.kind = 'session' AND h.targetId = s.sessionId)`).get().n,
         byPlatform: {
           wechat: {
-            videos: db.prepare("SELECT COUNT(*) AS n FROM videos WHERE platform='wechat'").get().n,
-            comments: db.prepare("SELECT COUNT(*) AS n FROM comments WHERE platform='wechat'").get().n,
+            videos: db.prepare(`SELECT COUNT(*) AS n FROM videos WHERE platform='wechat' AND ${liveAccountCond('accountId')}`).get().n,
+            comments: db.prepare(`SELECT COUNT(*) AS n FROM comments WHERE platform='wechat' AND ${liveAccountCond('accountId')}`).get().n,
           },
           douyin: {
-            videos: db.prepare("SELECT COUNT(*) AS n FROM videos WHERE platform='douyin'").get().n,
-            comments: db.prepare("SELECT COUNT(*) AS n FROM comments WHERE platform='douyin'").get().n,
+            videos: db.prepare(`SELECT COUNT(*) AS n FROM videos WHERE platform='douyin' AND ${liveAccountCond('accountId')}`).get().n,
+            comments: db.prepare(`SELECT COUNT(*) AS n FROM comments WHERE platform='douyin' AND ${liveAccountCond('accountId')}`).get().n,
           },
         },
       },
@@ -1424,6 +1464,7 @@ const routes = {
     const platform = u.searchParams.get('platform') || 'wechat';
     const accountId = Number(u.searchParams.get('accountId')) || 0;
     const objectId = u.searchParams.get('objectId') || '';
+    if (!getAccount(accountId)) return sendJson(res, 200, { list: [] });
     const all = db.prepare('SELECT * FROM comments WHERE platform = ? AND accountId = ? AND exportId = ? ORDER BY createTime ASC')
       .all(platform, accountId, objectId);
     const marks = handledSet(platform, accountId, 'comment');
@@ -1451,14 +1492,31 @@ const routes = {
       ],
     });
   },
-  // 标记完成/取消
+  // 标记完成/取消。kind=video：离开某条视频时，把上面未回复的评论标完成。
   'POST /api/handled': async (req, res) => {
     const body = await readBody(req);
     const platform = String(body.platform || '');
     const accountId = Number(body.accountId) || 0;
-    const kind = body.kind === 'session' ? 'session' : 'comment';
+    const kind = body.kind === 'session' ? 'session' : body.kind === 'video' ? 'video' : 'comment';
     const targetId = String(body.targetId || '');
     if (!platform || !accountId || !targetId) return sendJson(res, 400, { ok: false, error: '参数不全' });
+    if (kind === 'video') {
+      const rows = db.prepare(`
+        SELECT commentId FROM comments c
+        WHERE c.platform = ? AND c.accountId = ? AND c.exportId = ?
+          AND ${pendingCommentCond('c')}`).all(platform, accountId, targetId);
+      const now = Math.floor(Date.now() / 1000);
+      const ins = db.prepare('INSERT OR REPLACE INTO handled_marks(platform,accountId,kind,targetId,createdAt) VALUES(?,?,?,?,?)');
+      db.exec('BEGIN');
+      try {
+        for (const row of rows) ins.run(platform, accountId, 'comment', row.commentId, now);
+        db.exec('COMMIT');
+      } catch (e) {
+        db.exec('ROLLBACK');
+        throw e;
+      }
+      return sendJson(res, 200, { ok: true, marked: rows.length });
+    }
     if (body.done) {
       db.prepare('INSERT OR REPLACE INTO handled_marks(platform,accountId,kind,targetId,createdAt) VALUES(?,?,?,?,?)')
         .run(platform, accountId, kind, targetId, Math.floor(Date.now() / 1000));
@@ -1477,11 +1535,11 @@ const routes = {
       SELECT c.platform, c.accountId, c.commentId, c.exportId, c.nickname, c.content, c.createTime,
              v.title AS videoTitle
       FROM comments c LEFT JOIN videos v ON v.platform = c.platform AND v.accountId = c.accountId AND v.objectId = c.exportId
-      WHERE c.content LIKE ? OR c.nickname LIKE ?
+      WHERE (${liveAccountCond('c.accountId')}) AND (c.content LIKE ? OR c.nickname LIKE ?)
       ORDER BY c.createTime DESC LIMIT 30`).all(like, like);
     const sessions = db.prepare(`
       SELECT platform, accountId, sessionId, nickname, headImgUrl FROM dm_sessions
-      WHERE nickname LIKE ? LIMIT 20`).all(like);
+      WHERE ${liveAccountCond('accountId')} AND nickname LIKE ? LIMIT 20`).all(like);
     sendJson(res, 200, { comments, sessions });
   },
   'GET /api/dm/sessions': (req, res, u) => {
@@ -1581,6 +1639,34 @@ const libraryHandle = createLibrary({
   uploadDir: UPLOAD_DIR,
 });
 
+const assetsApi = createAssets({
+  sendJson,
+  readBody,
+  assetDir: path.join(DATA_DIR, 'assets'),
+  guessStyle: createNotes.pickStyle,
+});
+const assetsHandle = assetsApi.handle;
+
+const notesHandle = createNotes({
+  sendJson,
+  readBody,
+  noteDir: path.join(DATA_DIR, 'notes'),
+  assets: assetsApi,
+});
+
+const updateHandle = createUpdate({
+  sendJson,
+  root: path.join(__dirname, '..'),
+});
+
+function staticHeaders(filePath) {
+  const ext = path.extname(filePath);
+  const headers = { 'Content-Type': MIME[ext] || 'application/octet-stream' };
+  if (ext === '.html') headers['Cache-Control'] = 'no-store';
+  else if (filePath.includes(`${path.sep}assets${path.sep}`)) headers['Cache-Control'] = 'public, max-age=31536000, immutable';
+  return headers;
+}
+
 function serveStatic(req, res, pathname) {
   let p = decodeURIComponent(pathname);
   if (p === '/') p = '/index.html';
@@ -1589,14 +1675,15 @@ function serveStatic(req, res, pathname) {
   fs.readFile(file, (err, data) => {
     if (err) {
       // SPA 回退
-      fs.readFile(path.join(STATIC_DIR, 'index.html'), (e2, html) => {
+      const htmlFile = path.join(STATIC_DIR, 'index.html');
+      fs.readFile(htmlFile, (e2, html) => {
         if (e2) { res.writeHead(404); return res.end('not found'); }
-        res.writeHead(200, { 'Content-Type': MIME['.html'] });
+        res.writeHead(200, staticHeaders(htmlFile));
         res.end(html);
       });
       return;
     }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    res.writeHead(200, staticHeaders(file));
     res.end(data);
   });
 }
@@ -1608,6 +1695,9 @@ const server = http.createServer(async (req, res) => {
     if (pathname.startsWith('/api/')) {
       if (!apiAuthed(req, u)) return sendJson(res, 401, { error: 'unauthorized' });
       if (pathname.startsWith('/api/library/')) return await libraryHandle(req, res, u);
+      if (pathname.startsWith('/api/notes/')) return await notesHandle(req, res, u);
+      if (pathname.startsWith('/api/assets/')) return await assetsHandle(req, res, u);
+      if (pathname.startsWith('/api/update/')) return await updateHandle(req, res, u);
       const key = `${req.method} ${pathname}`;
       if (routes[key]) return await routes[key](req, res, u);
       // 上传文件（原始字节流，非 multipart）：?kind=video|cover&filename=xx.mp4
@@ -1706,10 +1796,7 @@ const server = http.createServer(async (req, res) => {
         // 级联清理该账号的历史数据与待处理标记，避免残留孤儿数据继续计入统计
         db.exec('BEGIN');
         try {
-          for (const t of ['videos', 'comments', 'dm_sessions', 'dm_messages']) {
-            db.prepare(`DELETE FROM ${t} WHERE accountId = ?`).run(id);
-          }
-          db.prepare('DELETE FROM handled_marks WHERE accountId = ?').run(id);
+          deleteAccountData(id);
           db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
           db.exec('COMMIT');
         } catch (e) {
@@ -1819,11 +1906,11 @@ if (require.main === module) {
     server.headersTimeout = 120000;
     console.log(`[inbox] listening on :${PORT}, db=${DB_PATH}, static=${STATIC_DIR}`);
     collectAll('startup');
-    setInterval(() => { collectAll('interval').catch(console.error); }, 5 * 60 * 1000);
+    setInterval(() => { collectAll('interval').catch(console.error); }, COLLECT_INTERVAL_MS);
   });
 }
 
 // 纯逻辑导出供单元测试（require 本文件不会启动服务/采集）
 module.exports = {
-  dyParseTime, pick, isAuthError, avatarHostAllowed, accountCond, pendingCommentCond, wxExtractUuid,
+  dyParseTime, pick, isAuthError, isWxRetryable, avatarHostAllowed, accountCond, pendingCommentCond, wxExtractUuid,
 };
