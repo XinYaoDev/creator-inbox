@@ -162,7 +162,7 @@ export default function AccountsTab({
 
       <section className="acct-main">
         <div className="acct-summary mono">
-          已连接 {accounts.length} 个账号 · {onlineCount} 个在线 · 最近同步 {fmtTime(lastCollect)}
+          已添加 {accounts.length} 个账号 · {onlineCount} 个在线 · 最近同步 {fmtTime(lastCollect)}
           {msg && <span className="pub-ok">{msg}</span>}
         </div>
 

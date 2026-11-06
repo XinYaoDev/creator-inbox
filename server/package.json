@@ -2,5 +2,5 @@
   "name": "creator-inbox-server",
   "private": true,
   "type": "commonjs",
-  "description": "Zero-dependency Node backend (overrides root package.json type:module so require() works)"
+  "description": "Native HTTP/SQLite backend with bounded HTML extraction dependencies; CommonJS server boundary"
 }

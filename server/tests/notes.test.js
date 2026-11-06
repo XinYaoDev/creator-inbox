@@ -4,6 +4,21 @@ const test = require('node:test');
 const assert = require('node:assert');
 const notes = require('../notes.js');
 
+test('workspace GPT config is used for all content requests; legacy keys and hospitality persona do not leak in',async t=>{
+  const {mkdtempSync,rmSync}=require('node:fs'),{tmpdir}=require('node:os'),{join}=require('node:path');
+  const dir=mkdtempSync(join(tmpdir(),'notes-gpt-settings-')),requests=[];
+  const original=global.fetch;global.fetch=async(url,options)=>{requests.push({url,options,body:JSON.parse(options.body)});return {ok:true,json:async()=>({choices:[{message:{content:requests.at(-1).body.messages[0].content.includes('审核内容')?'{{"ok":true}}'.slice(1,-1):JSON.stringify({title:'试听安排',body:'周末试听为 30 分钟。',tags:['试听']})}}]})}};
+  t.after(()=>{global.fetch=original;rmSync(dir,{recursive:true,force:true})});
+  let key='sk-test-workspace-only';
+  const handler=notes({sendJson:(r,s,d)=>{r.status=s;r.data=d},readBody:async r=>r.body,noteDir:dir,log:()=>{},modelConfig:()=>({key,base:'https://api.openai.com/v1',model:'gpt-workspace'}),brandContext:()=> '本品牌提供声乐试听，不经营酒店'});
+  const call=async(path,body)=>{const r={};await handler({method:body?'POST':'GET',body},r,new URL('http://localhost/api/notes/'+path));return r.data};
+  assert.equal((await call('status')).modelSource,'workspace');
+  const draft=await call('draft',{topic:'试听安排',material:'周末试听为 30 分钟。'});assert.equal(draft.fallback,false);assert.equal(draft.body,'周末试听为 30 分钟。');
+  assert.ok(requests.length>=2);assert.ok(requests.every(r=>r.options.headers.Authorization==='Bearer '+key&&r.body.model==='gpt-workspace'&&r.options.redirect==='error'));
+  assert.ok(requests[0].body.messages[0].content.includes('本品牌提供声乐试听'));assert.ok(!requests[0].body.messages[0].content.includes('宁海'));
+  key='';const count=requests.length;const fallback=await call('draft',{topic:'试听',material:'周末试听为 30 分钟。'});assert.equal(fallback.fallback,true);assert.equal(requests.length,count);assert.equal((await call('status')).llm,false);
+});
+
 test('parseLlmJson: 去掉 markdown 围栏', () => {
   const v = notes.parseLlmJson('```json\n{"body":"hi","tags":["a"]}\n```');
   assert.strictEqual(v.body, 'hi');
@@ -15,10 +30,10 @@ test('parseLlmJson: 前有废话也能切到 JSON', () => {
   assert.strictEqual(v.body, 'x');
 });
 
-test('fallbackDraft: 无选题也有正文和话题', () => {
+test('fallbackDraft: 无素材时提供编辑提示，不伪造故事和话题', () => {
   const d = notes.fallbackDraft('');
-  assert.ok(d.body.includes('宁海'));
-  assert.ok(d.tags.length >= 2);
+  assert.ok(d.body.includes('补充真实素材'));
+  assert.deepStrictEqual(d.tags, []);
   assert.ok(d.title);
 });
 
@@ -26,6 +41,8 @@ test('fallbackDraft: 素材第一句会写进正文', () => {
   const d = notes.fallbackDraft('', '退潮后来的，挖到三只蛏子。下雨打牌。');
   assert.ok(d.body.includes('挖到三只蛏子'));
   assert.ok(d.title.includes('蛏子') || d.title.includes('退潮'));
+  assert.strictEqual(d.body, '退潮后来的，挖到三只蛏子。下雨打牌。');
+  assert.ok(!d.body.includes('小青龙'));
 });
 
 test('pickStyle: 按素材选套式', () => {

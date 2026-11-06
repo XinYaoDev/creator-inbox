@@ -27,7 +27,7 @@
 
 | room | 入口 | 干什么 |
 |---|---|---|
-| `write`（默认） | 打开做笔记 | 写一条笔记：素材 → 标题正文 → 图组 |
+| `write`（默认） | 打开做笔记 | 写一条笔记：素材 → 文案 → 镜头清单 → 配图 |
 | `stock` | 工具条「囤参考」 | 贴小红书链接进参考堆；回填自己发过的赞藏评 |
 
 工具条（write）：左「囤参考」，右「再做一条」（二次确认后清空）。  
@@ -37,56 +37,51 @@
 
 ## 2. 主路径（write）用户流程
 
-左边写字，右边图组。一个主按钮按状态往前推：
+左栏始终是文章。右栏三态互斥：还没拆镜头 / 镜头清单 / 六宫格配图。文案、镜头、配图环环相扣但互不自动冲掉。
 
 ```
-今日素材（必填才能起草）
+今日素材
     │
-    ▼ 主按钮「起草」→ POST /api/notes/draft
-标题 + 正文 + 话题标签 + 套式 style + lint
+    ▼ 主按钮「起草笔记」→ POST /api/notes/draft
+标题 + 正文 + 话题（改标题正文不会重拆镜头）
     │
-    ├─ lint 失败：红字 +「按这个改一版」→ POST /api/notes/lint {rewrite:true}
-    ├─ 「再写一版」再调 draft
+    ▼ 主按钮「拆镜头」→ POST /api/notes/storyboard
+右栏出现镜头清单（只要 want，没有缩略图）。可改、换序、删、加（最多 6）。
+「再写一版」只改文案。「重新拆镜头」才按当前正文再调 storyboard（已有图会二次确认）。
     │
-    ▼ 主按钮「拆成图组」→ POST /api/notes/storyboard
-6 个 slot（封面、图2…图6），每张有 want（中文）和 prompt（英文出图词）
+    ▼ 主按钮「定这组镜头」→ shotsLocked=true，按 want 刷新 prompt
+这时才出现六宫格。⋯「改镜头」回到清单，已放入的图按 id 挂着。
     │
-    ▼ 主按钮「出图」→ 对还没图的 slot 逐张 POST /api/notes/generate-one
+    ▼ 主按钮「补齐 n 张图」→ 缺图的 slot 调 generate-one
     │
-    ▼ 主按钮「复制全文」→ 剪贴板 = 标题 + 正文 + #标签
-       同时 POST /api/assets/note 存成稿（同标题+正文重复则 no-op）
+    ▼ 主按钮「复制全文」
 ```
 
-主按钮状态机（`primary`，见 `NoteTab.tsx`）：
+主按钮（`primary`）：
 
-`hasSeed = material.trim() || topic.trim()`（素材**或**标题有字即可起草，不必两栏都填）。
+1. 进行中：`stage`，disabled  
+2. 无 seed：「起草笔记」，disabled  
+3. 还没正文：「起草笔记」  
+4. 有正文、无清单：「拆镜头」  
+5. 有清单、未锁定：「定这组镜头」  
+6. 已锁定、缺图：「补齐 n 张图」  
+7. 满图：「复制全文」
 
-1. 进行中：`stage` 文案，disabled  
-2. 素材和标题都空：「先写今日素材」，disabled  
-3. 还没正文：「起草」→ `draftCopy` → `POST /api/notes/draft {material, topic}`  
-4. 有正文、还没 slot：「拆成图组」→ `splitBoard`  
-5. 有空图位：「出图」→ `genMissing`（只补缺图；进行中显示 `出图 i/n · 角色`）  
-6. 都有图：「复制全文」/「已复制」→ `copyFull`
+`shotsLocked` 存在 `note_draft`。旧草稿若已有 `imageId` 视为已锁定。
 
-次按钮（不抢主路径）：
-
-- 有正文且有 seed：「再写一版」再调 draft  
-- 六格都有图：「再出这一组」也调 `genMissing`，此时 **所有格都会重出**（因为 `slots.some(!imageId)` 为 false，target = 全部）  
-- lint 失败：红条 +「按这个改一版」→ `POST /api/notes/lint {rewrite:true}`  
-- 无 LLM key 且还没正文：灰字「文案模型还没接上，起草会用本地底稿。」  
-- fallback 起草成功：灰字「没走模型，这是本地底稿。」
+次按钮：有正文时「再写一版」（不动镜头）。lint / fallback 提示不变。配图 `⋯` 里才有「再出这一组」。不在文案阶段放「先放一张」。
 
 左边三栏：今日素材 / 标题 / 正文。标题可先手写方向，起草成功后会被模型标题覆盖（`if (r.title) setTopic`）。话题标签是 chip，点一下去掉；服务端最多 8 个，localStorage 读回最多 12 个。字数只在有正文时显示在标题行右侧。
 
-未拆图时，右边不是六条空卡片，而是一句：「先写左边。也可先放一张实拍。」（有正文则改成「正文定了，主按钮会拆成图组。」）+「先放一张」。点「先放一张」打开 PhotoPicker（`ghostIndex: 0`）；放入成功后若 `slots` 还空，会 `emptySlots()` 建 6 个空位并把图写到第 0 格。
+未拆镜头时，右边一句提示，无宫格。拆完未锁定时是清单，不是格子。
 
 ---
 
-## 3. 右侧图组 UI（当前）
+## 3. 右侧：镜头清单 / 配图
 
 ### 3.1 六宫格
 
-`slots.length > 0` 时渲染 3 列 × 2 行宫格（CSS `.note-board`）。最多展示 6 格。服务端 `normalizeSlots` 最多收 9 张，UI 只画前 6。不足 6 张时用 `GHOST_ROLES` **补空壳进渲染数组，不写进 `slots` state**。空壳 id 是新造的 `s{n}`；改它的 `want` 会 `patchSlot` 找不到真 slot，改了即丢。拆图后一般是满 6 格，问题不大。
+仅 `shotsLocked` 时渲染宫格（CSS `.note-board`）。格数等于已定镜头（1–6），不补空壳。服务端 `normalizeSlots` 最多 9 张，拆镜头时前端只收 6 张。
 
 布局：`.note-layout` = `minmax(0,1.15fr) minmax(260px,0.85fr)`，800px 以下叠成一列。
 
@@ -135,13 +130,13 @@ type Slot = {
 - 纯 txt2img：只有 `imageId`，无 `photoId` → 可「存进库」  
 - 「拿掉」：清 `imageId`、`photoId`、`variants`（仅当有 photoId 时按钮出现）
 
-拆图时会尽量保留旧格上已放的图（按 index 或同 role 对齐）。
+「重新拆镜头」按当前正文重出清单，不保留旧图。「改镜头」退回清单，图按 slot id 挂着。
 
 ---
 
 ## 4. 选图：素材库弹层 PhotoPicker
 
-打开条件：放一张 / 换一张 / 更多 / 空桌「先放一张」。
+打开条件：找实拍 / 换实拍 / 更多（配图阶段）。
 
 布局：左专辑列表（由 `file_path` **前端**推导，不打 tag），右缩略图。  
 专辑规则（`albumOf`，与 `server/caption.js` 的 `albumFromPath` 对齐）：
@@ -363,7 +358,7 @@ K3 超时 180s，其它模型 60s。标题禁：整栋/包吃住/首选/性价�
 - 「再出这一组」会重出已有实拍格，且不走 img2img。  
 - 没有「最近用过 / 已发布勿重复」沉淀。  
 - Hermes 桥必须 Mac 在线；文案模型在 NAS 出站调 Kimi。  
-- 做笔记草稿只在本机 `localStorage` 键 `note_draft`：素材/标题/正文/tags/slots/openId/style/lint。换浏览器会丢文案；图文件在 NAS `data/notes/`。旧草稿刷新后宫格可能还挂着已删的 `imageId`。  
+- 做笔记草稿只在本机 `localStorage` 键 `note_draft`：含 `shotsLocked`。换浏览器会丢文案；图文件在 NAS `data/notes/`。  
 - 推荐条无结果时整条不渲染（没有「没有合适的」空态），只能靠「放一张」。  
 - suggest 是 keyword⊂query 和 caption 2-gram，**不是**语义向量；短 want（如「封面」）经常匹配弱。
 
@@ -371,10 +366,10 @@ K3 超时 180s，其它模型 60s。标题禁：整栋/包吃住/首选/性价�
 
 ## 14. 端到端手测清单
 
-1. 硬刷新做笔记。空桌：左三栏输入 + 一个黄按钮；右一句提示，无六条卡片。  
-2. 写两句素材 → 起草 → 有标题正文。  
-3. 拆成图组 → 右 6 格；点封面 → 下有 want 和推荐（有描述的库图才会出）。  
-4. 点一张推荐 → 封面格子换成这张。  
+1. 硬刷新做笔记。空桌：左「今天发生了什么」+ 起草笔记；右无宫格。  
+2. 写两句素材 → 起草 → 左边变成文章。  
+3. 拆镜头 → 右是 6 行清单，无格子；改一行、换序后点「定这组镜头」。  
+4. 才出宫格；点封面 → 下有推荐。点一张推荐换上。  
 5. 换一张 → 弹层点任意缩略图 → 格子立刻换，弹层关。  
 6. 用这张生（需 Hermes）→ 图变、photoId 还在。  
 7. 对只有生成图的格「存进库」→ 素材库来源「AI 生成」能看到。  

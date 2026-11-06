@@ -40,6 +40,17 @@ test('scoreAsset: 关键词命中 + 实拍加权', () => {
   assert.equal(scoreAsset(photo, '完全不相关的词xyz'), 0);
 });
 
+test('scoreAsset: 句子里的词能打到描述', () => {
+  const a = {
+    ai_caption: '小朋友蹲在滩涂上挖蛏子',
+    ai_keywords: '',
+    original_tags: '',
+    file_path: '/m/赶海/a.jpg',
+    source: 'nas',
+  };
+  assert.ok(scoreAsset(a, '小孩抓蛏子的瞬间') > 0);
+});
+
 test('scoreAsset: 专辑名命中', () => {
   const a = {
     ai_caption: '',

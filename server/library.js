@@ -291,16 +291,25 @@ CREATE INDEX IF NOT EXISTS idx_ann_asset ON asset_annotations(asset_id);
     return { list, total };
   }
 
+  function idSet(raw) {
+    return new Set(String(raw || '').split(',').map((s) => s.trim()).filter(Boolean));
+  }
+
   function suggest(u) {
     const q = (u.searchParams.get('q') || '').trim();
     const limit = Math.min(Math.max(Number(u.searchParams.get('limit')) || 8, 1), 24);
     if (!q) return { list: [], total: 0 };
+    const exclude = idSet(u.searchParams.get('exclude'));
+    const used = idSet(u.searchParams.get('used'));
     const rows = db.prepare(`SELECT id, thumb_path, file_path, ai_caption, ai_keywords, original_tags, source, shoot_time
       FROM media_assets WHERE file_type='image' AND status='indexed'`).all();
     const scored = [];
     for (const r of rows) {
-      const score = scoreAsset(r, q);
-      if (score > 0) scored.push({ ...r, score });
+      if (exclude.has(String(r.id))) continue;
+      let score = scoreAsset(r, q);
+      if (score <= 0) continue;
+      if (used.has(String(r.id))) score = Math.max(1, score - 3);
+      scored.push({ ...r, score });
     }
     scored.sort((a, b) => b.score - a.score || (b.shoot_time || 0) - (a.shoot_time || 0));
     return {

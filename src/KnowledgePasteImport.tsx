@@ -1,0 +1,13 @@
+import {useState} from 'react'
+export default function KnowledgePasteImport({request,action,busy,onImported}:any){
+  const [draft,setDraft]=useState({filename:'业务知识.csv',format:'csv',content:'',category:'导入资料'}),[preview,setPreview]=useState<any>(null)
+  const change=(part:Partial<typeof draft>)=>{setDraft(d=>({...d,...part}));setPreview(null)}
+  return <section className="g-panel g-knowledge-import"><h3>粘贴 / 小文件导入</h3><p className="g-hint">支持 UTF-8 TXT、Markdown、CSV、JSON（700 KB 以内）。CSV 表头为 title,body,category，或 标题,内容,分类；JSON 为条目数组。先预览、再导入，重复内容自动跳过，新条目默认停用。</p>
+    <form onSubmit={e=>{e.preventDefault();void action(async()=>setPreview(await request('/knowledge/import-preview',draft)))}}><fieldset className="g-permission" disabled={busy}><div className="g-form-grid">
+      <label className="g-field">选择文本文件<input type="file" accept=".txt,.md,.csv,.json" onChange={e=>{const file=e.target.files?.[0];if(!file)return;void action(async()=>{setPreview(null);change({content:''});const format=file.name.split('.').pop()?.toLowerCase()||'';if(file.size>700000)throw new Error('文本超过 700 KB，请使用“大文件导入”');if(!['txt','md','csv','json'].includes(format))throw new Error('不支持此文件格式');change({filename:file.name,format,content:await file.text()})})}}/></label>
+      <label className="g-field">格式<select value={draft.format} onChange={e=>change({format:e.target.value})}>{['csv','json','txt','md'].map(f=><option key={f}>{f}</option>)}</select></label>
+      <label className="g-field">来源名称<input value={draft.filename} onChange={e=>change({filename:e.target.value})} maxLength={200} required/></label><label className="g-field">默认分类<input value={draft.category} onChange={e=>change({category:e.target.value})} maxLength={100} required/></label>
+    </div><label className="g-field">文件内容 / 直接粘贴<textarea rows={8} value={draft.content} onChange={e=>change({content:e.target.value})} required placeholder={'title,body,category\n营业时间,每天 09:00–18:00,门店信息'}/></label><button className="primary">预览并检查</button></fieldset></form>
+    {preview&&<div className="g-import-preview"><h4>将新增 {preview.added} 条，跳过 {preview.skipped} 条重复记录</h4><div className="g-table-wrap"><table className="g-table"><thead><tr><th>标题</th><th>分类</th><th>内容预览</th><th>结果</th></tr></thead><tbody>{preview.items.map((k:any,i:number)=><tr key={i}><td>{k.title}</td><td>{k.category}</td><td>{k.body.slice(0,100)}</td><td>{k.duplicate?'重复 · 跳过':'新增 · 默认停用'}</td></tr>)}</tbody></table></div><button className="primary" disabled={busy||!preview.added} onClick={()=>action(async()=>{await request('/knowledge/import',draft);setPreview(null);onImported()},'知识已导入，审核后可批量启用')}>确认导入 {preview.added} 条</button></div>}
+  </section>
+}

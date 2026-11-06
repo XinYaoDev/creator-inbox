@@ -1,0 +1,29 @@
+{
+  "fields": {
+    "need": {"label":"需求","question":"这次主要想解决什么需求？"},
+    "quantity": {"label":"人数 / 数量","question":"预计有几位参加，或需要多少份呢？"},
+    "timing": {"label":"时间安排","question":"你希望安排在什么时候？"},
+    "budget": {"label":"预算","question":"方便说一下这次的预算范围吗？"},
+    "preference": {"label":"偏好","question":"还有什么希望我们特别留意的偏好吗？"},
+    "stayLength": {"label":"入住晚数","question":"这次预计住几晚呢？"},
+    "roomType": {"label":"房型需求","question":"对房型或床型有什么偏好吗？"},
+    "product": {"label":"商品 / 型号","question":"你想了解哪款商品或型号？"},
+    "specification": {"label":"规格 / 尺寸","question":"需要什么规格或尺寸呢？"},
+    "serviceArea": {"label":"服务城市 / 区域","question":"需要在哪个城市或区域提供服务？暂时不需要详细地址。"},
+    "serviceScope": {"label":"服务范围","question":"这次希望包含哪些服务内容？"},
+    "experience": {"label":"学习基础","question":"你之前有相关学习或体验经历吗？"},
+    "learningGoal": {"label":"学习目标","question":"你希望通过这次学习达到什么目标？"},
+    "teamSize": {"label":"使用团队规模","question":"预计有多少位同事使用？"},
+    "currentSystem": {"label":"现用系统 / 对接需求","question":"目前使用什么系统，有哪些需要对接的环节？"},
+    "activityType": {"label":"活动类型","question":"这次是朋友体验、团队活动，还是其他类型的活动？"}
+  },
+  "scenarios": [
+    {"id":"general","name":"通用接待","description":"适合尚未确定行业的基础咨询。","fields":["need","quantity","timing","budget","preference"],"required":["need","timing"],"goal":"了解真实需求，依据知识说明合适方案，顾客确认后交由人工落实。","guard":"价格、优惠和实际执行必须有依据；不把咨询、询价或普通认可当成成交。"},
+    {"id":"hospitality","name":"住宿 / 民宿","description":"入住需求、晚数、房型与行程变更。","fields":["need","quantity","timing","stayLength","roomType","budget","preference"],"required":["timing","stayLength","quantity","roomType"],"goal":"了解入住日期、晚数、人数及房型，按知识介绍设施和政策，明确同意后交给人工核实房态。","guard":"仅收集入住需求，不索取身份证、精确行踪等敏感资料。没有实时房态不得保证有房、锁房或宣称预订成功；日期意向不等于要求查询房态。"},
+    {"id":"retail","name":"零售 / 商品咨询","description":"选品、型号、规格和购买顾虑。","fields":["need","product","specification","quantity","budget","timing","preference"],"required":["need","product","specification"],"goal":"了解用途、商品与规格，依据资料解释差异和售后政策，顾客明确推进后由人工核实库存及订单。","guard":"不编造库存、物流时效、折扣和兼容性；未知型号先澄清。售后、退款或已有订单问题优先处理，不继续销售追问，不要求支付密码或完整银行卡。"},
+    {"id":"services","name":"本地生活 / 上门服务","description":"服务区域、范围、时间与报价边界。","fields":["need","serviceArea","serviceScope","timing","quantity","budget","preference"],"required":["serviceArea","serviceScope","timing"],"goal":"了解服务城市或区域、内容及期望时间，说明报价包含项和限制，人工确认排期与最终报价。","guard":"接待阶段只需要城市或区域，不索取门牌、门锁密码。没有现场核实不得承诺最终报价；不编造服务覆盖范围或可用师傅，不保证消除所有污渍或故障。"},
+    {"id":"education","name":"成人课程 / 技能培训","description":"学习目标、已有基础、时间安排。","fields":["need","learningGoal","experience","timing","quantity","budget","preference"],"required":["learningGoal","experience","timing"],"goal":"了解成人学习目标、基础和时间，以课程事实推荐合适路径；确认后由人工落实试听或报名。","guard":"不保证考试通过、就业、收入或学习效果。基础与偏好不得推断智力、健康或身份属性。不给未知班期、师资和名额作承诺，不索取身份证或成绩隐私。"},
+    {"id":"software","name":"企业软件 / B2B","description":"业务痛点、团队规模、现有系统与部署需求。","fields":["need","teamSize","currentSystem","timing","budget","preference"],"required":["need","teamSize","currentSystem"],"goal":"理解业务痛点、团队规模及现用系统，按资料解释能力与限制；确认后交给人工安排演示和技术核实。","guard":"不索取系统密码、API 密钥或客户数据库；不编造集成、合规认证、可用性或性能承诺。未知对接方式由技术人员核实；询问功能不等于已同意采购。"},
+    {"id":"experience","name":"体验活动 / 团建","description":"活动类型、人数、经验与时间需求。","fields":["need","activityType","quantity","experience","timing","budget","preference"],"required":["activityType","quantity","timing"],"goal":"了解活动类型、人数和时间，依据知识推荐适合的体验，确认后由人工核实场地和名额。","guard":"不编造场地容量、余位、包场价格或安全保证；只讨论已知适用范围，不推断健康情况。未获顾客同意不代为报名或承诺预留。"}
+  ]
+}

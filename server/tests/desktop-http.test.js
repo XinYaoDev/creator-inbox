@@ -1,0 +1,24 @@
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict');
+const {spawn}=require('node:child_process'),{once}=require('node:events');
+const {mkdtempSync,rmSync}=require('node:fs'),{tmpdir}=require('node:os'),{join}=require('node:path');
+test('desktop gateway: real HTTP session, origin boundary, disabled legacy updater and owned-process shutdown',async t=>{
+  const directory=mkdtempSync(join(tmpdir(),'desktop-gateway-')),secret='a'.repeat(64);
+  const child=spawn(process.execPath,[join(__dirname,'../index.js')],{env:{...process.env,PORT:'0',DB_PATH:join(directory,'data.db'),LAIKE_DESKTOP_SECRET:secret,DISABLE_COLLECT:'1',GROWTH_DEMO:'1',AUTH_TOKEN:'',GROWTH_TEAM_TOKENS:'',COOKIE_FILE:join(directory,'missing'),DY_COOKIE_FILE:join(directory,'missing')},stdio:['ignore','ignore','pipe','ipc']});
+  child.stderr.resume();
+  t.after(async()=>{if(child.exitCode===null){child.kill();await once(child,'exit');}rmSync(directory,{recursive:true,force:true});});
+  const port=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('desktop startup timeout')),10000);child.once('exit',()=>{clearTimeout(timer);reject(new Error('early exit'));});child.on('message',m=>{if(m.type==='desktop-ready'){clearTimeout(timer);resolve(m.port);}});});
+  const origin='http://127.0.0.1:'+port;
+  assert.equal((await fetch(origin+'/api/growth/state')).status,401);
+  assert.equal((await fetch(origin+'/_desktop/connect?ticket='+'中'.repeat(64))).status,401);
+  const bootstrap=await fetch(origin+'/_desktop/connect?ticket='+secret,{redirect:'manual'});assert.equal(bootstrap.status,200);assert.match(await bootstrap.text(),/location.replace/);
+  const cookie=bootstrap.headers.get('set-cookie').split(';')[0];assert.match(bootstrap.headers.get('set-cookie'),/HttpOnly; SameSite=Strict/);
+  assert.equal((await fetch(origin+'/api/growth/state',{headers:{Cookie:cookie}})).status,200);
+  assert.equal((await fetch(origin+'/api/growth/state',{headers:{Cookie:cookie,Origin:'https://attacker.example'}})).status,403);
+  const hostileHost=await new Promise((resolve,reject)=>{require('node:http').get(origin+'/api/growth/state',{headers:{Cookie:cookie,Host:'attacker.example:'+port}},res=>{res.resume();resolve(res.statusCode);}).on('error',reject);});
+  assert.equal(hostileHost,403);
+  assert.equal((await fetch(origin+'/api/update/check',{headers:{Cookie:cookie}})).status,409);
+  assert.equal((await fetch(origin+'/_desktop/health',{headers:{Authorization:'Bearer '+secret}})).status,200);
+  const stopped=once(child,'exit');child.disconnect();await stopped;
+  await assert.rejects(fetch(origin+'/_desktop/health',{signal:AbortSignal.timeout(1000)}));
+});

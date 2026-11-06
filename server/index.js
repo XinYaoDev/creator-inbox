@@ -8,6 +8,12 @@ const createLibrary = require('./library.js');
 const createNotes = require('./notes.js');
 const createAssets = require('./assets.js');
 const createUpdate = require('./update.js');
+const { createGrowth } = require('./growth.js');
+const { createAccess } = require('./access.js');
+const { createTeam } = require('./team.js');
+const { createModelSettings } = require('./model-settings.js');
+const { createWebChat } = require('./web-chat.js');
+const { createCaptioner } = require('./caption.js');
 
 const http = require('node:http');
 const fs = require('node:fs');
@@ -19,8 +25,10 @@ const PORT = Number(process.env.PORT || 8877);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'inbox.db');
 const STATIC_DIR = process.env.STATIC_DIR || path.join(__dirname, '..', 'dist');
 const DATA_DIR = path.dirname(DB_PATH);
+const desktopGateway = require('./desktop-gateway.js').createDesktopGateway(process.env.LAIKE_DESKTOP_SECRET);
 // 可选访问令牌：设置后所有 /api/* 请求需带 Authorization: Bearer <token>（或 ?token=，供 <img>/<video> 直链）
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '');
+const access = createAccess({adminToken:AUTH_TOKEN,teamJson:process.env.GROWTH_TEAM_TOKENS});
 
 function apiAuthed(req, u) {
   if (!AUTH_TOKEN) return true;
@@ -786,6 +794,7 @@ async function collectAll(trigger = 'auto') {
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
@@ -797,16 +806,20 @@ const MIME = {
 
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(body);
 }
 
 function readBody(req) {
-  return new Promise((resolve) => {
-    let buf = '';
-    req.on('data', (c) => { buf += c; if (buf.length > 1e6) req.destroy(); });
-    req.on('end', () => { try { resolve(JSON.parse(buf || '{}')); } catch { resolve({}); } });
-    req.on('error', () => resolve({}));
+  return new Promise((resolve,reject) => {
+    let chunks=[],size=0,settled=false;
+    const finish=(error,value)=>{if(settled)return;settled=true;clearTimeout(timer);chunks=[];error?reject(error):resolve(value);};
+    const invalid=(message,status=400)=>Object.assign(new Error(message),{status});
+    const timer=setTimeout(()=>finish(invalid('请求内容读取超时',408)),30000);timer.unref();
+    req.on('data',c=>{if(settled)return;size+=c.length;if(size>1024*1024){finish(invalid('JSON 请求内容超过 1 MB',413));return;}chunks.push(c);});
+    req.on('end',()=>{if(settled)return;try{const data=JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');if(!data||typeof data!=='object'||Array.isArray(data))throw Error();finish(null,data);}catch{finish(invalid('请提交有效的 JSON 对象'));}});
+    req.on('aborted',()=>finish(invalid('请求已中断')));
+    req.on('error',()=>finish(invalid('请求读取失败')));
   });
 }
 
@@ -1633,6 +1646,7 @@ const routes = {
 const NOTE_DIR = path.join(DATA_DIR, 'notes');
 const libraryHandle = createLibrary({
   db,
+  captioner:createCaptioner({db,modelConfig:()=>({...modelSettings.resolve('default'),shared:true})}),
   sendJson,
   readBody,
   mediaRoot: process.env.MEDIA_ROOT || '',
@@ -1658,6 +1672,8 @@ const assetsHandle = assetsApi.handle;
 const notesHandle = createNotes({
   sendJson,
   readBody,
+  modelConfig:()=>modelSettings.resolve('default'),
+  brandContext:()=>growthFor('default').get('agent','default')?.brand||'',
   noteDir: NOTE_DIR,
   assets: assetsApi,
   readLibraryImage(id) {
@@ -1676,10 +1692,33 @@ const updateHandle = createUpdate({
   root: path.join(__dirname, '..'),
 });
 
+const growthSpaces = new Map();
+const modelSettings=createModelSettings({db,keyPath:path.join(DATA_DIR,'.model-encryption-key'),hermes:require('./hermes-codex.js').createHermesCodex()});
+const webChat=createWebChat({db,growthFor,sendJson,readBody});
+const channelCallbackPort=Number(process.env.CHANNEL_CALLBACK_PORT||0);
+if(!Number.isInteger(channelCallbackPort)||channelCallbackPort<0||channelCallbackPort>65535)throw new Error('CHANNEL_CALLBACK_PORT 必须是有效端口');
+const channelListener=require('./channel-listener.js').createChannelListener({db,initialPort:channelCallbackPort,callback:(req,res,u)=>platformChannels.callback(req,res,u)});
+const platformChannels=require('./platform-channels.js').createPlatformChannels({db,keyPath:path.join(DATA_DIR,'.model-encryption-key'),growthFor,sendJson,readBody,listener:channelListener});
+function growthFor(workspaceId='default') {
+  if (!growthSpaces.has(workspaceId)) growthSpaces.set(workspaceId,createGrowth({
+    db, sendJson, readBody, workspaceId, modelSettings, webChat, platformChannels,
+    modelConfig:()=>{try{return modelSettings.resolve(workspaceId);}catch{return {...modelSettings.publicSettings(workspaceId),key:'',embeddingsEnabled:false};}},
+    sendExternal: (conversation, content) => {
+      if(workspaceId!=='default')throw new Error('该工作空间尚未接入外部渠道');
+      return enqueueWrite(() => conversation.sourceKind === 'comment'
+        ? replyToComment(conversation.channel, conversation.accountId, conversation.sourceId, content)
+        : sendDM(conversation.sourceId, conversation.accountId, content));
+    },
+  }));
+  return growthSpaces.get(workspaceId);
+}
+const team = createTeam({db,access,sendJson,readBody,onMember:user=>growthFor(user.workspaceId).put('member',{name:user.name,active:user.active,userId:user.id},user.id)});
+for(const space of team.workspaces())growthFor(space.id);
+
 function staticHeaders(filePath) {
   const ext = path.extname(filePath);
   const headers = { 'Content-Type': MIME[ext] || 'application/octet-stream' };
-  if (ext === '.html') headers['Cache-Control'] = 'no-store';
+  if (ext === '.html'||path.basename(filePath)==='build.json') headers['Cache-Control'] = 'no-store';
   else if (filePath.includes(`${path.sep}assets${path.sep}`)) headers['Cache-Control'] = 'public, max-age=31536000, immutable';
   return headers;
 }
@@ -1688,9 +1727,12 @@ function serveStatic(req, res, pathname) {
   let p = decodeURIComponent(pathname);
   if (p === '/') p = '/index.html';
   const file = path.normalize(path.join(STATIC_DIR, p));
-  if (!file.startsWith(path.normalize(STATIC_DIR))) { res.writeHead(403); return res.end(); }
+  const relative=path.relative(STATIC_DIR,file);
+  if (relative==='..'||relative.startsWith('..'+path.sep)||path.isAbsolute(relative)) { res.writeHead(403); return res.end(); }
   fs.readFile(file, (err, data) => {
     if (err) {
+      // Missing versioned files must not masquerade as a successful HTML response.
+      if(path.extname(p)){res.writeHead(404,{'Content-Type':'text/plain; charset=utf-8','Cache-Control':'no-store'});return res.end('not found');}
       // SPA 回退
       const htmlFile = path.join(STATIC_DIR, 'index.html');
       fs.readFile(htmlFile, (e2, html) => {
@@ -1708,9 +1750,21 @@ function serveStatic(req, res, pathname) {
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    if (desktopGateway && desktopGateway(req, res, u)) return;
     const pathname = u.pathname;
+    if(pathname.startsWith('/chat/')){
+      for(const [key,value] of Object.entries(webChat.frameHeaders(pathname.split('/')[2])))res.setHeader(key,value);
+    }
     if (pathname.startsWith('/api/')) {
-      if (!apiAuthed(req, u)) return sendJson(res, 401, { error: 'unauthorized' });
+      if(pathname.startsWith('/api/channel-callback/'))return await platformChannels.callback(req,res,u);
+      if(pathname.startsWith('/api/webchat/'))return await webChat.handle(req,res,u);
+      if(pathname.startsWith('/api/team/'))return await team.handle(req,res,u);
+      team.checkOrigin(req);
+      req.access=team.identity(req,u);
+      if (!req.access) return sendJson(res, 401, { error: 'unauthorized' });
+      if (!access.allowed(req.access,req.method,pathname)) return sendJson(res,403,{error:'当前角色没有执行此操作的权限'});
+      if (pathname==='/api/growth/channels'||pathname.startsWith('/api/growth/channels/'))return await platformChannels.handle(req,res,u);
+      if (pathname.startsWith('/api/growth/')) return await growthFor(req.access.workspaceId).handle(req, res, u);
       if (pathname.startsWith('/api/library/')) return await libraryHandle(req, res, u);
       if (pathname.startsWith('/api/notes/')) return await notesHandle(req, res, u);
       if (pathname.startsWith('/api/assets/')) return await assetsHandle(req, res, u);
@@ -1912,19 +1966,45 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(405); res.end();
   } catch (e) {
     console.error('[http]', e);
-    sendJson(res, 500, { error: String(e && e.message || e) });
+    sendJson(res, e.status || 500, { error: String(e && e.message || e) });
   }
 });
 
 if (require.main === module) {
-  server.listen(PORT, () => {
+  server.listen(PORT, desktopGateway ? '127.0.0.1' : process.env.HOST || '0.0.0.0', () => {
     // 上传大文件耗时长，放宽请求超时
     server.requestTimeout = 0;
     server.headersTimeout = 120000;
-    console.log(`[inbox] listening on :${PORT}, db=${DB_PATH}, static=${STATIC_DIR}`);
-    collectAll('startup');
-    setInterval(() => { collectAll('interval').catch(console.error); }, COLLECT_INTERVAL_MS);
+    console.log(`[inbox] listening on :${server.address().port}, db=${DB_PATH}, static=${STATIC_DIR}`);
+    if (process.env.DISABLE_COLLECT !== '1') {
+      collectAll('startup');
+      setInterval(() => { collectAll('interval').catch(console.error); }, COLLECT_INTERVAL_MS);
+    }
+    for(const space of team.workspaces())growthFor(space.id).sync();
+    webChat.tick();
+    // Explicitly configured callback-only listener. Never exposes the desktop UI,
+    // management routes, files, or launch secret to a reverse proxy.
+    void channelListener.start();
+    setInterval(()=>platformChannels.tick(),5000).unref();
+    if (desktopGateway && process.send) process.send({type:'desktop-ready',port:server.address().port});
+    setInterval(() => {
+      for(const space of team.workspaces()) {
+        try { const growth=growthFor(space.id);growth.sync();growth.tick(); } catch (error) { console.error('[growth]', error.message); }
+      }
+      webChat.tick();
+    }, 30000).unref();
   });
+  if (desktopGateway) {
+    const shutdown = () => {
+      channelListener.close();
+      server.close(() => { try { db.close(); } finally { process.exit(0); } });
+      server.closeAllConnections();
+      setTimeout(() => process.exit(0), 1500).unref();
+    };
+    process.once('SIGTERM', shutdown);
+    process.once('SIGINT', shutdown);
+    process.once('disconnect', shutdown);
+  }
 }
 
 // 纯逻辑导出供单元测试（require 本文件不会启动服务/采集）

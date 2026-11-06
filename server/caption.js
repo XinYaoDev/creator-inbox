@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
-const { parseLlmJson, visionConfig, isKimiK3 } = require('./llm.js');
+const { parseLlmJson, visionConfig, usesReasoningEffort } = require('./llm.js');
 
 const CAPTION_SYSTEM = [
   '你在给民宿创作者的图片素材库写检索用描述。看图输出 JSON：',
@@ -41,6 +41,13 @@ function parseCaption(text) {
   return { caption, keywords };
 }
 
+function tokensOf(q) {
+  return String(q || '')
+    .split(/[\s,，、。！？；;：:的了在和与是]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2);
+}
+
 function scoreAsset(asset, q) {
   const query = String(q || '').trim();
   if (!query) return 0;
@@ -59,6 +66,10 @@ function scoreAsset(asset, q) {
   const hitMeta = (tags && (query.includes(tags) || tags.split(/[/,\s]+/).some((t) => t && query.includes(t))))
     || (album && (query.includes(album) || album.length >= 2 && query.includes(album)));
   if (hitMeta) score += 2;
+  const hay = `${asset.ai_caption || ''} ${asset.ai_keywords || ''} ${asset.file_path || ''}`;
+  for (const t of tokensOf(query)) {
+    if (hay.includes(t)) score += 2;
+  }
   if (score > 0 && (asset.source === 'nas' || asset.source === 'upload')) score += 1;
   return score;
 }
@@ -86,9 +97,9 @@ function shrinkForVision(filePath) {
   });
 }
 
-async function captionImage(filePath) {
-  const { key, base, model } = visionConfig();
-  if (!key) throw new Error('没有视觉模型 key');
+async function captionImage(filePath,config=visionConfig()) {
+  const { key, base, model } = config;
+  if (!key&&!config.complete) throw new Error('尚未配置视觉模型连接');
   let src = filePath;
   let tmp = null;
   const stat = fs.statSync(filePath);
@@ -100,8 +111,9 @@ async function captionImage(filePath) {
     const buf = fs.readFileSync(src);
     const payload = {
       model,
+      max_completion_tokens:2048,
       messages: [
-        { role: 'system', content: CAPTION_SYSTEM },
+        { role: 'system', content: config.shared?'只描述图片中实际可见的内容、场景和构图，不推断人物身份、不编造品牌或产品效果。输出 JSON：{"caption":"30字内中文描述","keywords":["3到6个可见内容检索词"]}':CAPTION_SYSTEM },
         {
           role: 'user',
           content: [
@@ -111,16 +123,18 @@ async function captionImage(filePath) {
         },
       ],
     };
-    if (isKimiK3(model)) payload.reasoning_effort = 'low';
+    if (usesReasoningEffort(model)) payload.reasoning_effort = 'low';
     else payload.temperature = 0.2;
+    if(config.complete)return parseCaption((await config.complete(payload)).choices?.[0]?.message?.content);
     const r = await fetch(`${base}/chat/completions`, {
       method: 'POST',
+      redirect:'error',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(60000),
+      signal: AbortSignal.timeout(usesReasoningEffort(model) ? 180000 : 60000),
     });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error?.message || `视觉接口 HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`视觉接口 HTTP ${r.status}，请核对模型设置与模型的图片输入能力`);
     const text = data.choices?.[0]?.message?.content;
     if (!text) throw new Error('视觉接口没有返回内容');
     return parseCaption(text);
@@ -129,7 +143,7 @@ async function captionImage(filePath) {
   }
 }
 
-function createCaptioner({ db, log = console.log }) {
+function createCaptioner({ db, log = console.log, modelConfig=visionConfig }) {
   const state = { running: false, cancel: false, done: 0, total: 0, errors: [], startedAt: 0, finishedAt: 0 };
   const now = () => Math.floor(Date.now() / 1000);
 
@@ -141,7 +155,7 @@ function createCaptioner({ db, log = console.log }) {
   async function captionRow(row) {
     const src = row.thumb_path && fs.existsSync(row.thumb_path) ? row.thumb_path : row.file_path;
     if (!src || !fs.existsSync(src)) throw new Error('找不到图');
-    const { caption, keywords } = await captionImage(src);
+    const { caption, keywords } = await captionImage(src,modelConfig());
     saveCaption(row.id, caption, keywords);
   }
 

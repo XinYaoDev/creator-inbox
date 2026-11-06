@@ -4,6 +4,10 @@ function isKimiK3(model) {
   return /^(k3|kimi-k3)\b/i.test(String(model || ''));
 }
 
+function usesReasoningEffort(model) {
+  return isKimiK3(model) || /^gpt-(?:5|6)(?:[.-]|$)/i.test(String(model || ''));
+}
+
 function parseLlmJson(text) {
   const raw = String(text || '').trim();
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -48,7 +52,7 @@ function llmConfig() {
     return {
       key: process.env.OPENAI_API_KEY,
       base: baseOverride || 'https://api.openai.com/v1',
-      model: modelOverride || 'gpt-4o-mini',
+      model: modelOverride || 'gpt-6-astra',
     };
   }
   return { key: '', base: '', model: '' };
@@ -61,4 +65,4 @@ function visionConfig() {
   return { key: llm.key, base: llm.base, model };
 }
 
-module.exports = { isKimiK3, parseLlmJson, llmConfig, visionConfig };
+module.exports = { isKimiK3, usesReasoningEffort, parseLlmJson, llmConfig, visionConfig };
